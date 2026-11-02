@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.5"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.6"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -559,7 +559,9 @@ EOF
 # 全被占才回退随机端口（回退后该链直连可用，但不能套 Cloudflare 橙色云）
 pick_vtls_port() {
   local allocated="$1" p
-  for p in 443 8443 2053 2083 2087 2096; do
+  # 443 是建站等大量服务的默认端口，默认让开：优先 8443 等 Cloudflare 同样
+  # 支持的 HTTPS 端口，443 只排最后兜底（全被占才用），再不行才随机
+  for p in 8443 2053 2083 2087 2096 443; do
     if [[ "$allocated" != *" $p "* ]] && ! port_in_use "$p"; then
       echo "$p"
       return 0
@@ -954,7 +956,7 @@ domain_a_records() {
 # 倒计时只在用户尚未输入时刷新本行；一开始输入就擦掉倒计时、不再干扰。
 # 管道/文件输入没有行编辑问题，沿用整行分片累积（超时片读的部分输入也算）。
 prompt_line_countdown() {
-  local _secs="$1" _prompt="$2" _src="${3:-}" _buf="" _ch="" _junk="" _chunk="" _raw=""
+  local _secs="$1" _prompt="$2" _src="${3:-}" _buf="" _ch="" _junk="" _chunk=""
   local _i _rc _is_tty=0 _old_stty="" _left="$_secs"
   REPLY_LINE=""
   if [[ -n "$_src" ]]; then
@@ -963,49 +965,53 @@ prompt_line_countdown() {
     [[ -t 0 ]] && _is_tty=1
   fi
   if [[ "$_is_tty" == "1" ]]; then
+    # stty 一律走重定向作用于目标终端（不用 GNU 专属的 -F，精简工具集也兼容）
     if [[ -n "$_src" ]]; then
-      _old_stty=$(stty -F "$_src" -g 2>/dev/null) || _is_tty=0
+      _old_stty=$(stty -g < "$_src" 2>/dev/null) || _is_tty=0
     else
       _old_stty=$(stty -g 2>/dev/null) || _is_tty=0
     fi
   fi
   if [[ "$_is_tty" == "1" ]]; then
-    if [[ -n "$_src" ]]; then stty -F "$_src" -icanon -echo -isig 2>/dev/null; else stty -icanon -echo -isig 2>/dev/null; fi
+    if [[ -n "$_src" ]]; then stty -icanon -echo -isig < "$_src" 2>/dev/null; else stty -icanon -echo -isig 2>/dev/null; fi
+    # 逐字节读只用 bash 自带 read，不再借 dd/timeout：timeout 的进程组处理
+    # 与部分精简系统（BusyBox 等）的工具差异都曾让 /dev/tty 一个字节都读
+    # 不到。read -n 首次调用会冲掉输入队列，先在打印提示前空读一次吸收掉
+    if [[ -n "$_src" ]]; then IFS= read -r -n 1 -t 0.3 _ch < "$_src" || true; else IFS= read -r -n 1 -t 0.3 _ch || true; fi
     printf '\r%s（还剩 %d 秒）\033[K' "$_prompt" "$_left" >&2
     while [[ "$_left" -gt 0 ]]; do
-      # 逐字节读不用 read -n：它在切换 termios 时会冲掉输入队列，吃掉首字节
-      # （实测域名首字母丢失）。改用 timeout+dd（完全不碰 termios），末尾加
-      # 哨兵字节区分「读到的就是换行」与「1 秒无字节」
-      if [[ -n "$_src" ]]; then _raw=$(timeout --foreground 1 dd bs=1 count=1 < "$_src" 2>/dev/null; printf '\001'); else _raw=$(timeout --foreground 1 dd bs=1 count=1 2>/dev/null; printf '\001'); fi
-      if [[ "$_raw" == $'\001' ]]; then
+      if [[ -n "$_src" ]]; then IFS= read -r -n 1 -t 1 _ch < "$_src"; else IFS= read -r -n 1 -t 1 _ch; fi
+      _rc=$?
+      if [[ $_rc -eq 0 ]]; then
+        case "$_ch" in
+          $'\n'|$'\r') break ;;
+          $'\003')   # Ctrl-C：先恢复终端再自发中断信号，保持原有行为
+            if [[ -n "$_src" ]]; then stty "$_old_stty" < "$_src" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+            kill -INT $$ ;;
+          $'\032')   # Ctrl-Z：同理恢复后挂起
+            if [[ -n "$_src" ]]; then stty "$_old_stty" < "$_src" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+            kill -TSTP $$ ;;
+          $'\033')   # 方向键等转义序列：吞掉后续字节，不进输入
+            if [[ -n "$_src" ]]; then IFS= read -r -n 2 -t 0.3 _junk < "$_src" || true; else IFS= read -r -n 2 -t 0.3 _junk || true; fi ;;
+          $'\177'|$'\b')
+            if [[ -n "$_buf" ]]; then _buf="${_buf%?}"; printf '\b \b' >&2; fi ;;
+          $'\004')   # Ctrl-D：空输入按结束处理，有内容则忽略
+            [[ -z "$_buf" ]] && break ;;
+          [[:print:]])
+            if [[ -z "$_buf" ]]; then printf '\r%s\033[K' "$_prompt" >&2; fi
+            _buf+="$_ch"; printf '%s' "$_ch" >&2 ;;
+          *) ;;      # 其他控制字符忽略
+        esac
+      elif [[ $_rc -ge 128 ]]; then
         _left=$((_left-1))
         if [[ -z "$_buf" && "$_left" -gt 0 ]]; then
           printf '\r%s（还剩 %d 秒）\033[K' "$_prompt" "$_left" >&2
         fi
-        continue
+      else
+        break        # EOF
       fi
-      _ch="${_raw%$'\001'}"
-      case "$_ch" in
-        $'\n'|$'\r') break ;;
-        $'\003')   # Ctrl-C：先恢复终端再自发中断信号，保持原有行为
-          if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
-          kill -INT $$ ;;
-        $'\032')   # Ctrl-Z：同理恢复后挂起
-          if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
-          kill -TSTP $$ ;;
-        $'\033')   # 方向键等转义序列：吞掉后续字节，不进输入
-          if [[ -n "$_src" ]]; then timeout --foreground 0.3 dd bs=2 count=1 < "$_src" >/dev/null 2>&1 || true; else timeout --foreground 0.3 dd bs=2 count=1 >/dev/null 2>&1 || true; fi ;;
-        $'\177'|$'\b')
-          if [[ -n "$_buf" ]]; then _buf="${_buf%?}"; printf '\b \b' >&2; fi ;;
-        $'\004')   # Ctrl-D：空输入按结束处理，有内容则忽略
-          [[ -z "$_buf" ]] && break ;;
-        [[:print:]])
-          if [[ -z "$_buf" ]]; then printf '\r%s\033[K' "$_prompt" >&2; fi
-          _buf+="$_ch"; printf '%s' "$_ch" >&2 ;;
-        *) ;;      # 其他控制字符忽略
-      esac
     done
-    if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+    if [[ -n "$_src" ]]; then stty "$_old_stty" < "$_src" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
     printf '\n' >&2
     REPLY_LINE="$_buf"
     [[ -n "$REPLY_LINE" ]] && return 0

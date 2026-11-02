@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.3"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.4"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -240,6 +240,10 @@ open_firewall() {
   # 回退：配置文件不存在或 jq 不可用时，用 PORT_* 变量
   if [[ -z "${ports// }" ]]; then
     ports="${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-} ${PORT_VTLS:-}"
+  fi
+  # 直连真证书（direct 模式）签发/续期要走 HTTP-01，额外放行 80
+  if [[ "${TLS_ACME:-0}" == "1" && "${TLS_ACME_MODE:-cf}" == "direct" ]]; then
+    ports="${ports} 80"
   fi
   if [[ -z "${ports// }" ]]; then
     echo "[警告] 未找到需要放行的端口，跳过防火墙设置"
@@ -546,6 +550,7 @@ PORT_VTLS="${PORT_VTLS:-}"
 TLS_DOMAIN="${TLS_DOMAIN:-}"
 TLS_DOMAIN_AUTO="${TLS_DOMAIN_AUTO:-1}"
 TLS_ACME="${TLS_ACME:-0}"
+TLS_ACME_MODE="${TLS_ACME_MODE:-cf}"
 EOF
   chmod 600 "$ENV_FILE"
 }
@@ -739,6 +744,7 @@ cf_setup_domain() {
     printf 'CF_HOST="%s"\n' "$_fqdn"
   } > "$CF_ENV_FILE"
   chmod 600 "$CF_ENV_FILE"
+  TLS_ACME_MODE="cf"
   echo "[信息] 已套 Cloudflare：$_fqdn → $_ip（橙色云代理），SSL 模式=完全（严格）"
 }
 
@@ -942,10 +948,70 @@ domain_a_records() {
 
 # 带倒计时的限时输入：$1=总秒数 $2=提示语 $3=输入来源（/dev/tty 或空=stdin）
 # 读到的整行写入全局 REPLY_LINE；读到非空行返回 0，无输入/直接回车/读完返回 1。
-# 倒计时只在尚未输入任何字符时刷新本行，用户开始输入后不再干扰其输入显示
+# 真实终端必须走 raw 逐字读：普通 read 是整行交付，没法在用户敲键期间逐秒
+# 刷新倒计时（回显会被倒计时帧反复覆盖，光标错位、输入看着像乱码），逐字
+# 读则要自己处理回显、退格、回车（\r/\n 都算）、方向键转义序列与 Ctrl-C。
+# 倒计时只在用户尚未输入时刷新本行；一开始输入就擦掉倒计时、不再干扰。
+# 管道/文件输入没有行编辑问题，沿用整行分片累积（超时片读的部分输入也算）。
 prompt_line_countdown() {
-  local _secs="$1" _prompt="$2" _src="${3:-}" _chunk="" _i _rc
+  local _secs="$1" _prompt="$2" _src="${3:-}" _buf="" _ch="" _junk="" _chunk="" _raw=""
+  local _i _rc _is_tty=0 _old_stty="" _left="$_secs"
   REPLY_LINE=""
+  if [[ -n "$_src" ]]; then
+    [[ -e "$_src" ]] && _is_tty=1
+  else
+    [[ -t 0 ]] && _is_tty=1
+  fi
+  if [[ "$_is_tty" == "1" ]]; then
+    if [[ -n "$_src" ]]; then
+      _old_stty=$(stty -F "$_src" -g 2>/dev/null) || _is_tty=0
+    else
+      _old_stty=$(stty -g 2>/dev/null) || _is_tty=0
+    fi
+  fi
+  if [[ "$_is_tty" == "1" ]]; then
+    if [[ -n "$_src" ]]; then stty -F "$_src" -icanon -echo -isig 2>/dev/null; else stty -icanon -echo -isig 2>/dev/null; fi
+    printf '\r%s（还剩 %d 秒）\033[K' "$_prompt" "$_left" >&2
+    while [[ "$_left" -gt 0 ]]; do
+      # 逐字节读不用 read -n：它在切换 termios 时会冲掉输入队列，吃掉首字节
+      # （实测域名首字母丢失）。改用 timeout+dd（完全不碰 termios），末尾加
+      # 哨兵字节区分「读到的就是换行」与「1 秒无字节」
+      if [[ -n "$_src" ]]; then _raw=$(timeout 1 dd bs=1 count=1 < "$_src" 2>/dev/null; printf '\001'); else _raw=$(timeout 1 dd bs=1 count=1 2>/dev/null; printf '\001'); fi
+      if [[ "$_raw" == $'\001' ]]; then
+        _left=$((_left-1))
+        if [[ -z "$_buf" && "$_left" -gt 0 ]]; then
+          printf '\r%s（还剩 %d 秒）\033[K' "$_prompt" "$_left" >&2
+        fi
+        continue
+      fi
+      _ch="${_raw%$'\001'}"
+      case "$_ch" in
+        $'\n'|$'\r') break ;;
+        $'\003')   # Ctrl-C：先恢复终端再自发中断信号，保持原有行为
+          if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+          kill -INT $$ ;;
+        $'\032')   # Ctrl-Z：同理恢复后挂起
+          if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+          kill -TSTP $$ ;;
+        $'\033')   # 方向键等转义序列：吞掉后续字节，不进输入
+          if [[ -n "$_src" ]]; then timeout 0.3 dd bs=2 count=1 < "$_src" >/dev/null 2>&1 || true; else timeout 0.3 dd bs=2 count=1 >/dev/null 2>&1 || true; fi ;;
+        $'\177'|$'\b')
+          if [[ -n "$_buf" ]]; then _buf="${_buf%?}"; printf '\b \b' >&2; fi ;;
+        $'\004')   # Ctrl-D：空输入按结束处理，有内容则忽略
+          [[ -z "$_buf" ]] && break ;;
+        [[:print:]])
+          if [[ -z "$_buf" ]]; then printf '\r%s\033[K' "$_prompt" >&2; fi
+          _buf+="$_ch"; printf '%s' "$_ch" >&2 ;;
+        *) ;;      # 其他控制字符忽略
+      esac
+    done
+    if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
+    printf '\n' >&2
+    REPLY_LINE="$_buf"
+    [[ -n "$REPLY_LINE" ]] && return 0
+    return 1
+  fi
+  # 管道/文件：整行分片累积
   for (( _i=_secs; _i>0; _i-- )); do
     if [[ -z "$REPLY_LINE" && -z "$_chunk" ]]; then
       printf '\r%s（还剩 %d 秒）' "$_prompt" "$_i" >&2
@@ -962,7 +1028,6 @@ prompt_line_countdown() {
       [[ -n "$REPLY_LINE" ]] && return 0
       return 1   # 直接回车（空行）
     fi
-    # 超时（rc≥128）时片读到的部分输入已赋给 _chunk，继续累积；EOF 等真实错误按无输入处理
     if [[ $_rc -lt 128 ]]; then
       printf '\n' >&2
       return 1
@@ -974,22 +1039,23 @@ prompt_line_countdown() {
 }
 
 # 域名校验失败后的统一处理：$1=累计失败次数 $2=启用临时域名后的提示后缀 $3=输入来源
-# 返回 0=用户选择重新输入；返回 1=用默认（3 次失败直接启用临时域名；
-# 未满 3 次时让用户选，10 秒不选自动默认）
+# 返回 0=重新输入；返回 1=用默认。只有明确输 2 才用默认：输 1、直接回车、
+# 输错其他字符、10 秒不选，都默认重新输入。错误累计满 3 次直接启用临时域名。
 domain_fail_next() {
   local _fails="$1" _suffix="$2" _src="${3:-}" _c=""
   if [[ "$_fails" -ge 3 ]]; then
     echo "[提示] 域名未正确解析（连续 3 次未通过校验），已启用临时域名。$_suffix"
+    echo "[提示] 域名校验不只看格式：直连时还查是否已解析到本机 IP（$(get_ip)），未生效是最常见原因；用 Cloudflare Token 时另查归属、NS 与 DNS-01。"
     return 1
   fi
-  echo "[选择] 1) 重新输入  2) 使用默认域名（10 秒内不选，自动用默认域名）"
+  echo "[选择] 1) 重新输入域名  2) 使用默认域名（回车、输错、10 秒不选，都默认重新输入；只有输 2 才用默认）"
   if [[ -n "$_src" ]]; then
     read -t 10 -r -p "请选择 [1/2]: " _c < "$_src" || _c=""
   else
     read -t 10 -r -p "请选择 [1/2]: " _c || _c=""
   fi
-  [[ "$_c" == "1" ]] && return 0
-  return 1
+  [[ "$_c" == "2" ]] && return 1
+  return 0
 }
 
 # 直连模式（脚本不管理 DNS）下的域名解析验证：$1 必须解析到本机公网 IP。
@@ -1038,7 +1104,7 @@ prompt_install_choices() {
           _tok_asked=1
           load_cf_token || true
           if [[ -z "${CF_API_TOKEN:-}" ]]; then
-            read -t 10 -r -p "Cloudflare API Token（申请真证书并套 CF；直接回车跳过，用自签直连）: " CF_API_TOKEN </dev/tty || CF_API_TOKEN=""
+            read -t 10 -r -p "Cloudflare API Token（申请真证书并套 CF；直接回车跳过（域名已解析到本机时自动直连申请真证书））: " CF_API_TOKEN </dev/tty || CF_API_TOKEN=""
           fi
           if [[ -n "${CF_API_TOKEN:-}" && ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
             echo "[警告] Token 含非法字符（Cloudflare API Token 只应含字母、数字、_ 与 -），已忽略，按自签直连处理"
@@ -1069,7 +1135,7 @@ prompt_install_choices() {
           fi
           break
         fi
-        # 无 Token 直连：域名必须已解析到本机，否则先报错重输
+        # 无 Token 直连：域名必须已解析到本机；解析正确直接走真证书申请
         if ! validate_domain_points_here "$_d"; then
           _fails=$((_fails+1))
           if domain_fail_next "$_fails" "安装完成后随时可以更改（运行 sbox change-domain）。" /dev/tty; then
@@ -1080,9 +1146,10 @@ prompt_install_choices() {
         cf_delete_managed_record   # 若临时域名是脚本在 CF 建的记录，先清掉再换
         TLS_DOMAIN="$_d"
         TLS_DOMAIN_AUTO=0
-        TLS_ACME=0
+        TLS_ACME=1
+        TLS_ACME_MODE="direct"
         save_env
-        echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
+        echo "[信息] 已采用域名：$TLS_DOMAIN（真证书，安装完成后自动签发并验证）"
         break
       fi
       break   # 无输入/直接回车：按默认用临时域名，不再问
@@ -1118,7 +1185,11 @@ write_config() {
   # sing-box 内置 ACME（DNS-01 走 Cloudflare，自动续期，不占 80/443、不装额外软件）
   local _tls_sni="${TLS_DOMAIN:-$SNI_SELF}" vtls_tls
   local _self_tls="\"enabled\": true, \"server_name\": \"$_tls_sni\", \"certificate_path\": \"$SB_DIR/cert.pem\", \"key_path\": \"$SB_DIR/private.key\""
-  if [[ "${TLS_ACME:-0}" == "1" ]]; then
+  if [[ "${TLS_ACME:-0}" == "1" && "${TLS_ACME_MODE:-cf}" == "direct" ]]; then
+    # 直连真证书：域名已解析到本机时走 ACME 通用验证（HTTP-01 / TLS-ALPN-01），
+    # 不依赖任何 DNS 服务商的 API；两个挑战都不禁，哪个通走哪个
+    vtls_tls="\"enabled\": true, \"server_name\": \"$_tls_sni\", \"certificate_provider\": {\"type\": \"acme\", \"domain\": [\"$_tls_sni\"], \"data_directory\": \"$SB_DIR/acme\", \"email\": \"admin@$_tls_sni\", \"provider\": \"letsencrypt\"}"
+  elif [[ "${TLS_ACME:-0}" == "1" ]]; then
     local _tok=""
     if [[ -f "$CF_ENV_FILE" ]]; then
       _tok=$(grep '^CF_API_TOKEN=' "$CF_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
@@ -1665,7 +1736,8 @@ acme_verify_or_fallback() {
   TLS_ACME=0
   save_env
   # 回退自签后 Cloudflare 若仍是「完全（严格）」会因源站证书不受信报 526，同步降为「完全」
-  if [[ -f "$CF_ENV_FILE" ]] && load_cf_token; then
+  # （direct 直连模式不经 Cloudflare，跳过这步）
+  if [[ "${TLS_ACME_MODE:-cf}" != "direct" && -f "$CF_ENV_FILE" ]] && load_cf_token; then
     local _zid_fb
     _zid_fb=$(grep '^CF_ZONE_ID=' "$CF_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
     if [[ -n "$_zid_fb" ]]; then
@@ -1689,7 +1761,7 @@ do_change_domain() {
   [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]] && _auto_desc="自动生成的临时域名"
   echo "当前 TLS 域名：${TLS_DOMAIN:-（未设置）}（$_auto_desc，证书：$_cert_desc，端口：${PORT_VTLS:-}）"
   echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
-  local _d="" _tok_asked=0 _fails=0 _use_default=0
+  local _d="" _tok_asked=0 _fails=0 _use_default=0 _direct_acme=0
   while true; do
     # 15 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
     if ! prompt_line_countdown 15 "输入新域名（无输入 = 重新自动生成临时域名）: "; then
@@ -1711,7 +1783,7 @@ do_change_domain() {
       _tok_asked=1
       load_cf_token || true
     if [[ -z "${CF_API_TOKEN:-}" ]]; then
-      read -rp "Cloudflare API Token（申请真证书并套 CF；直接回车跳过，用自签直连）: " CF_API_TOKEN || CF_API_TOKEN=""
+      read -rp "Cloudflare API Token（申请真证书并套 CF；直接回车跳过（域名已解析到本机时自动直连申请真证书））: " CF_API_TOKEN || CF_API_TOKEN=""
     fi
     if [[ -n "${CF_API_TOKEN:-}" && ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
       echo "[警告] Token 含非法字符（Cloudflare API Token 只应含字母、数字、_ 与 -），已忽略，按自签直连处理"
@@ -1730,7 +1802,8 @@ do_change_domain() {
         break
       fi
     else
-      # 无 Token 直连：脚本不管理 DNS，域名必须自己解析到本机，否则生成的链接是死的
+      # 无 Token 直连：域名必须自己解析到本机；解析正确就直接走真证书申请
+      # （HTTP-01 / TLS-ALPN-01 通用验证，不依赖任何 DNS 服务商 API）
       if ! validate_domain_points_here "$_d"; then
         _fails=$((_fails+1))
         if domain_fail_next "$_fails" "可随时再次运行 sbox change-domain 更改。"; then
@@ -1739,10 +1812,16 @@ do_change_domain() {
         _use_default=1
         break
       fi
+      _direct_acme=1
+      echo "[信息] 域名已解析到本机，直接申请 Let's Encrypt 真证书（通用验证，无需 Cloudflare）"
     fi
     TLS_DOMAIN="$_d"
     TLS_DOMAIN_AUTO=0
     TLS_ACME=0
+    if [[ "$_direct_acme" == "1" ]]; then
+      TLS_ACME=1
+      TLS_ACME_MODE="direct"
+    fi
     cf_delete_managed_record   # 验证通过后才清理旧域名的脚本记录
     if [[ -n "${CF_API_TOKEN:-}" ]]; then
       if cf_setup_domain "$TLS_DOMAIN"; then

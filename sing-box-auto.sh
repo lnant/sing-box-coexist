@@ -25,7 +25,7 @@
 #
 # 特性：
 #   - 全程无交互：UUID、密码、Reality 密钥对全部自动生成
-#   - 可选提问：有终端时安装会给 10 秒窗口填 TLS 域名与固定隧道 Token，
+#   - 可选提问：有终端时安装会给 60 秒窗口填 TLS 域名与固定隧道 Token，
 #     超时或无终端（curl|bash、远程无 tty）自动走默认——TLS 域名默认用
 #     服务器 IP 生成的 sslip.io 临时域名，隧道默认临时隧道；事后均可改：
 #     sbox change-domain 换域名（可同时申请真证书并套 Cloudflare），
@@ -51,7 +51,9 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.8"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.9"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+INPUT_TIMEOUT=60                # 输入类等待秒数：60 秒无输入自动按默认走下一步
+CHOICE_TIMEOUT=20               # 选择类等待秒数：20 秒无选择/回车一律取默认选择
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -698,7 +700,7 @@ validate_cf_domain() {
   _conf=$(cf_domain_conflicts "$_zid" "$_fqdn" "$_ip")
   if [[ -n "$_conf" ]]; then
     echo "[警告] $_fqdn 已有解析记录：$_conf"
-    read -t 10 -rp "输入 y 覆盖这些记录并继续，其他输入/10 秒无输入 = 重新输入域名: " _ans || _ans=""
+    read -t "$CHOICE_TIMEOUT" -rp "输入 y 覆盖这些记录并继续（回车/输错/20 秒无输入 = 默认选择：重新输入域名）: " _ans || _ans=""
     if [[ "$_ans" != "y" && "$_ans" != "Y" ]]; then
       return 1
     fi
@@ -926,7 +928,7 @@ load_or_gen_identity() {
 }
 
 #----------------------------- 6.5 安装时可选提问 ------------------------------
-# 只在有控制终端时出现，每题等 10 秒：无终端（curl|bash、远程无 tty、定时任务）
+# 只在有控制终端时出现：输入类等 60 秒、选择类等 20 秒，回车/超时一律取默认；无终端（curl|bash、远程无 tty、定时任务）
 # 或超时未输入，一律走已生成的默认——TLS 域名默认临时域名、隧道默认临时隧道，
 # 全程静默不受影响；填了的值事后都能改（change-domain / change-argo）。
 # 清理用户输入的域名：去空白、协议头、路径与尾点，并转小写（粘贴时常带这些）
@@ -1077,7 +1079,7 @@ prompt_line_countdown() {
 
 # 域名校验失败后的统一处理：$1=累计失败次数 $2=启用临时域名后的提示后缀 $3=输入来源
 # 返回 0=重新输入；返回 1=用默认。只有明确输 2 才用默认：输 1、直接回车、
-# 输错其他字符、10 秒不选，都默认重新输入。错误累计满 3 次直接启用临时域名。
+# 输错其他字符、20 秒不选，都按默认选择（重新输入）。错误累计满 3 次直接启用临时域名。
 domain_fail_next() {
   local _fails="$1" _suffix="$2" _src="${3:-}" _c=""
   if [[ "$_fails" -ge 3 ]]; then
@@ -1085,11 +1087,11 @@ domain_fail_next() {
     echo "[提示] 域名校验不只看格式：直连时还查是否已解析到本机 IP（$(get_ip)），未生效是最常见原因；用 Cloudflare Token 时另查归属、NS 与 DNS-01。"
     return 1
   fi
-  echo "[选择] 1) 重新输入域名  2) 使用默认域名（回车、输错、10 秒不选，都默认重新输入；只有输 2 才用默认）"
+  echo "[选择] 1) 重新输入域名  2) 使用默认域名（默认选择 = 1：回车、输错、20 秒不选都算默认；只有输 2 才用默认域名）"
   if [[ -n "$_src" ]]; then
-    read -t 10 -r -p "请选择 [1/2]: " _c < "$_src" || _c=""
+    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c < "$_src" || _c=""
   else
-    read -t 10 -r -p "请选择 [1/2]: " _c || _c=""
+    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c || _c=""
   fi
   [[ "$_c" == "2" ]] && return 1
   return 0
@@ -1139,7 +1141,7 @@ prompt_vtls_port() {
   echo "  4) 2083（注意：部分网络可能不支持）"
   echo "  5) 2087（注意：部分网络可能不支持）"
   echo "  6) 2096（注意：部分网络可能不支持）"
-  read -t 10 -r -p "请选择 [1-6]（直接回车或输错，默认 443）: " _c </dev/tty || _c=""
+  read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1-6]（回车/输错/20 秒不选，默认 443）: " _c </dev/tty || _c=""
   case "$_c" in
     2) _want=8443 ;;
     3) _want=2053 ;;
@@ -1170,7 +1172,7 @@ prompt_install_choices() {
     local _d="" _tok_asked=0 _fails=0
     echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
     while true; do
-      if prompt_line_countdown 15 "TLS 域名（无输入自动用临时域名 ${TLS_DOMAIN}）: " /dev/tty; then
+      if prompt_line_countdown "$INPUT_TIMEOUT" "TLS 域名（无输入自动用临时域名 ${TLS_DOMAIN}）: " /dev/tty; then
         _d=$(clean_domain "$REPLY_LINE")
         if ! valid_domain_format "$_d"; then
           echo "[错误] 域名格式不对（示例：node.example.com）"
@@ -1180,13 +1182,13 @@ prompt_install_choices() {
           fi
           break
         fi
-        # Token 只问一次：已保存的直接用；没有就给一次 10 秒填入机会，
+        # Token 只问一次：已保存的直接用；没有就给一次 60 秒填入机会，
         # 有 Token 时与 change-domain 走同一套深度验证 + 装时直接申请真证书
         if [[ "$_tok_asked" == "0" ]]; then
           _tok_asked=1
           load_cf_token || true
           if [[ -z "${CF_API_TOKEN:-}" ]]; then
-            read -t 10 -r -p "Cloudflare API Token（申请真证书并套 CF；直接回车跳过（域名已解析到本机时自动直连申请真证书））: " CF_API_TOKEN </dev/tty || CF_API_TOKEN=""
+            read -t "$INPUT_TIMEOUT" -r -p "Cloudflare API Token（申请真证书并套 CF；直接回车跳过（域名已解析到本机时自动直连申请真证书））: " CF_API_TOKEN </dev/tty || CF_API_TOKEN=""
           fi
           if [[ -n "${CF_API_TOKEN:-}" && ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
             echo "[警告] Token 含非法字符（Cloudflare API Token 只应含字母、数字、_ 与 -），已忽略，按自签直连处理"
@@ -1240,9 +1242,9 @@ prompt_install_choices() {
   # 2) Argo 固定隧道：还没配置过时给一次填 Token 的机会，默认临时隧道
   if [[ ! -f "$SB_DIR/argo.env" ]]; then
     local _tok="" _dom=""
-    echo "[可选] 10 秒内输入 Cloudflare 固定隧道 Token，超时/直接回车用临时隧道"
-    if read -t 10 -r -p "Argo Token: " _tok </dev/tty && [[ -n "$_tok" ]]; then
-      read -t 10 -r -p "固定隧道域名: " _dom </dev/tty || _dom=""
+    echo "[可选] 60 秒内输入 Cloudflare 固定隧道 Token，超时/直接回车用临时隧道"
+    if read -t "$INPUT_TIMEOUT" -r -p "Argo Token: " _tok </dev/tty && [[ -n "$_tok" ]]; then
+      read -t "$INPUT_TIMEOUT" -r -p "固定隧道域名: " _dom </dev/tty || _dom=""
       if [[ "$_tok" =~ ^[A-Za-z0-9+/=_-]+$ && "$_dom" =~ ^[A-Za-z0-9.-]+$ && "$_dom" == *.* && "$_dom" != .* && "$_dom" != *. ]]; then
         cat > "$SB_DIR/argo.env" <<EOF
 ARGO_MODE="fixed"
@@ -1253,6 +1255,7 @@ EOF
         ARGO_TOKEN="$_tok"
         ARGO_DOMAIN="$_dom"
         echo "[信息] 已配置固定隧道：$_dom"
+        echo "[提示] Token 方式的固定隧道，转发目标在 Cloudflare 侧管理：请确认隧道 ingress 指向 http://localhost:${PORT_VMESS}（本机 VMess 端口），不一致时 Argo 链会返回 502；可在 CF 面板修改，或用菜单「Argo 隧道管理」的 API 方式自动写入"
       else
         echo "[警告] Token/域名不完整或格式不对，继续用临时隧道"
       fi
@@ -1520,6 +1523,30 @@ EOF
   return 1
 }
 
+# 确保 cloudflared 已下载：缺失时按架构拉取官方版。成功输出路径，失败返回 1
+ensure_cloudflared() {
+  local cf="$SB_DIR/cloudflared"
+  if [[ ! -x "$cf" ]]; then
+    echo "[信息] 下载 cloudflared…" >&2
+    # cloudflared 的资产命名与 sing-box 不同：官方没有 armv7 资产，arm 版即给 armv7 用；
+    # 且菜单路径下 ARCH 可能未设置，这里按 uname 现算，不依赖 detect_arch
+    local cf_arch
+    case "$(uname -m)" in
+      x86_64) cf_arch="amd64" ;;
+      aarch64) cf_arch="arm64" ;;
+      armv7l) cf_arch="arm" ;;
+      *) cf_arch="${ARCH:-amd64}" ;;
+    esac
+    if ! curl -fSL --retry 2 -o "$cf" \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
+      echo "[警告] cloudflared 下载失败" >&2
+      return 1
+    fi
+    chmod +x "$cf"
+  fi
+  printf '%s' "$cf"
+}
+
 start_argo() {
   # 如果配置了固定隧道，优先使用固定隧道
   if [[ -f "$SB_DIR/argo.env" ]]; then
@@ -1533,26 +1560,8 @@ start_argo() {
     fi
   fi
   echo "[信息] 启动 Argo 临时隧道…"
-  local cf="$SB_DIR/cloudflared"
-  if [[ ! -x "$cf" ]]; then
-    echo "[信息] 下载 cloudflared…"
-    # cloudflared 的资产命名与 sing-box 不同：官方没有 armv7 资产，arm 版即给 armv7 用；
-    # 且菜单路径下 ARCH 可能未设置，这里按 uname 现算，不依赖 detect_arch
-    local cf_arch
-    case "$(uname -m)" in
-      x86_64) cf_arch="amd64" ;;
-      aarch64) cf_arch="arm64" ;;
-      armv7l) cf_arch="arm" ;;
-      *) cf_arch="${ARCH:-amd64}" ;;
-    esac
-    if ! curl -fSL --retry 2 -o "$cf" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
-      echo "[警告] cloudflared 下载失败，跳过 Argo（不影响其他 5 种协议）"
-      ARGO_DOMAIN=""
-      return 0
-    fi
-    chmod +x "$cf"
-  fi
+  local cf
+  cf=$(ensure_cloudflared) || { echo "[警告] cloudflared 下载失败，跳过 Argo（不影响其他 5 种协议）"; ARGO_DOMAIN=""; return 0; }
   systemctl stop "$ARGO_UNIT" >/dev/null 2>&1 || true   # 若之前由 systemd 托管，先停掉避免双开
   pkill -f "$SB_DIR/cloudflared.*tunnel.*--url" >/dev/null 2>&1 || true
   sleep 1
@@ -1845,8 +1854,8 @@ do_change_domain() {
   echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
   local _d="" _tok_asked=0 _fails=0 _use_default=0 _direct_acme=0
   while true; do
-    # 15 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
-    if ! prompt_line_countdown 15 "输入新域名（无输入 = 重新自动生成临时域名）: "; then
+    # 60 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
+    if ! prompt_line_countdown "$INPUT_TIMEOUT" "输入新域名（无输入 = 重新自动生成临时域名）: "; then
       _use_default=1
       break
     fi
@@ -1938,11 +1947,8 @@ do_change_domain() {
 
 # 启动 Argo 固定隧道
 start_argo_fixed() {
-  local cf="$SB_DIR/cloudflared"
-  if [[ ! -x "$cf" ]]; then
-    echo "[错误] cloudflared 未安装，请先运行一次安装"
-    return 1
-  fi
+  local cf
+  cf=$(ensure_cloudflared) || { echo "[警告] cloudflared 不可用，固定隧道未启动（不影响其他协议；网络恢复后运行 sbox restart 可重试）"; return 0; }
   if [[ -z "${ARGO_TOKEN:-}" ]]; then
     echo "[错误] 未配置 Argo Token"
     return 1
@@ -2018,6 +2024,7 @@ ARGO_TOKEN="$token"
 ARGO_DOMAIN="$domain"
 EOF
         chmod 600 "$SB_DIR/argo.env"
+        echo "[提示] Token 方式的固定隧道，转发目标在 Cloudflare 侧管理：请确认隧道 ingress 指向 http://localhost:${PORT_VMESS}（本机 VMess 端口），不一致时 Argo 链会返回 502；可在 CF 面板修改，或用本菜单的 API 方式自动写入"
         # shellcheck disable=SC1090
         . "$SB_DIR/argo.env"
         start_argo_fixed

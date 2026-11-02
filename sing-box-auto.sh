@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.10"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.11"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 INPUT_TIMEOUT=60                # 输入类等待秒数：60 秒无输入自动按默认走下一步
 CHOICE_TIMEOUT=20               # 选择类等待秒数：20 秒无选择/回车一律取默认选择
 
@@ -481,19 +481,25 @@ setup_shortcut() {
   if [[ -n "$self" && -f "$self" && "$self" != "/usr/local/bin/sbox" ]] \
      && grep -q "sing-box 全自动一键安装脚本" "$self" 2>/dev/null \
      && cp "$self" /usr/local/bin/sbox 2>/dev/null; then
-    chmod +x /usr/local/bin/sbox
+    chmod 755 /usr/local/bin/sbox
     ln -sf /usr/local/bin/sbox /usr/bin/sbox 2>/dev/null || true
     echo "[信息] 快捷命令已安装：直接打 sbox 进管理菜单（自动提权）"
     return 0
   fi
-  if fetch_latest_script /usr/local/bin/sbox; then
-    chmod +x /usr/local/bin/sbox
+  # 先下到临时文件、校验通过再覆盖（与 do_update_script 同一模式）：直接以 sbox 为下载目标时，
+  # 网络中断会把已有的好文件截断成残件；走临时文件则失败时原文件原封不动
+  local tmp_sbox
+  tmp_sbox=$(mktemp)
+  if fetch_latest_script "$tmp_sbox"; then
+    cp -f "$tmp_sbox" /usr/local/bin/sbox
+    chmod 755 /usr/local/bin/sbox
     # 部分系统 root 的 PATH（sudo secure_path）不含 /usr/local/bin，加个软链接兜底
     ln -sf /usr/local/bin/sbox /usr/bin/sbox 2>/dev/null || true
     echo "[信息] 快捷命令已安装：直接打 sbox 进管理菜单（自动提权）"
   else
     echo "[警告] sbox 快捷命令安装失败，可手动下载脚本使用"
   fi
+  rm -f "$tmp_sbox"
 }
 
 #----------------------------- 5. 自签证书 -----------------------------------
@@ -2131,7 +2137,7 @@ do_update_script() {
     local newver=""
     newver=$(grep -m1 '^SCRIPT_VERSION=' "$tmpfile" | cut -d'"' -f2 || true)
     cp -f "$tmpfile" /usr/local/bin/sbox
-    chmod +x /usr/local/bin/sbox
+    chmod 755 /usr/local/bin/sbox
     rm -f "$tmpfile"
     if [[ -n "$newver" ]]; then
       echo "[完成] 脚本已更新到 v$newver"

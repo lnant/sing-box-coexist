@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.6"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.7"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -559,9 +559,9 @@ EOF
 # 全被占才回退随机端口（回退后该链直连可用，但不能套 Cloudflare 橙色云）
 pick_vtls_port() {
   local allocated="$1" p
-  # 443 是建站等大量服务的默认端口，默认让开：优先 8443 等 Cloudflare 同样
-  # 支持的 HTTPS 端口，443 只排最后兜底（全被占才用），再不行才随机
-  for p in 8443 2053 2083 2087 2096 443; do
+  # 自动挑的顺序：443 优先（客户端网络兼容性最好），其次同为 Cloudflare
+  # 支持的 HTTPS 端口；首次安装时用户可在提问环节改选其它端口
+  for p in 443 8443 2053 2083 2087 2096; do
     if [[ "$allocated" != *" $p "* ]] && ! port_in_use "$p"; then
       echo "$p"
       return 0
@@ -848,6 +848,7 @@ load_or_gen_identity() {
     done
     if [[ -z "${PORT_VTLS:-}" ]]; then
       PORT_VTLS=$(pick_vtls_port "$used") || { echo "[错误] 端口分配失败，无法继续"; exit 1; }
+      VTLS_PORT_FRESH=1
     fi
     ensure_tls_domain
     if [[ -n "${UUID:-}" && -n "${PRIVKEY:-}" && -n "${PUBKEY:-}" && -n "${SHORTID:-}" ]]; then
@@ -882,6 +883,7 @@ load_or_gen_identity() {
       done
       if [[ -z "${PORT_VTLS:-}" ]]; then
         PORT_VTLS=$(pick_vtls_port "$_used") || { echo "[错误] 端口分配失败，无法继续"; exit 1; }
+        VTLS_PORT_FRESH=1
       fi
       ensure_tls_domain
       PRIVKEY=$(jq -r '.inbounds[0].tls.reality.private_key // empty' "$SB_DIR/sb.json" 2>/dev/null || true)
@@ -917,6 +919,7 @@ load_or_gen_identity() {
   PORT_TUIC=$(rand_port "$used"); used+=" $PORT_TUIC "
   PORT_ANYTLS=$(rand_port "$used"); used+=" $PORT_ANYTLS "
   PORT_VTLS=$(pick_vtls_port "$used") || { echo "[错误] 端口分配失败，无法继续"; exit 1; }
+  VTLS_PORT_FRESH=1
   ensure_tls_domain
   echo "[信息] 端口分配：VLESS=$PORT_VLESS VMess-WS=$PORT_VMESS Hy2=$PORT_HY2 TUIC=$PORT_TUIC AnyTLS=$PORT_ANYTLS VLESS-WS-TLS=$PORT_VTLS"
   save_env
@@ -1087,8 +1090,46 @@ validate_domain_points_here() {
   return 1
 }
 
+# 首次安装时选 TLS 链端口（仅在本轮刚自动分配过端口时问）：选项均为
+# Cloudflare 支持的 HTTPS 端口；回车/输错/超时一律默认 443；所选被占用
+# 或与其它链冲突时提示并回退 443，443 也不可用再走自动挑端口；选定播报。
+prompt_vtls_port() {
+  [[ "${VTLS_PORT_FRESH:-0}" == "1" ]] || return 0
+  local _c="" _want=""
+  local _others=" ${PORT_VLESS:-} ${PORT_VMESS:-} ${PORT_HY2:-} ${PORT_TUIC:-} ${PORT_ANYTLS:-} "
+  echo "[提示] TLS 端口选择（域名链使用，以下均为 Cloudflare 支持的 HTTPS 端口）："
+  echo "  1) 443（默认，大多数网络都支持）"
+  echo "  2) 8443（可避开建站等常用服务；注意：部分网络可能不支持）"
+  echo "  3) 2053（注意：部分网络可能不支持）"
+  echo "  4) 2083（注意：部分网络可能不支持）"
+  echo "  5) 2087（注意：部分网络可能不支持）"
+  echo "  6) 2096（注意：部分网络可能不支持）"
+  read -t 10 -r -p "请选择 [1-6]（直接回车或输错，默认 443）: " _c </dev/tty || _c=""
+  case "$_c" in
+    2) _want=8443 ;;
+    3) _want=2053 ;;
+    4) _want=2083 ;;
+    5) _want=2087 ;;
+    6) _want=2096 ;;
+    *) _want=443 ;;
+  esac
+  if [[ "$_want" != "443" ]] && { port_in_use "$_want" || [[ "$_others" == *" $_want "* ]]; }; then
+    echo "[提示] 端口 $_want 已被占用，改用 443"
+    _want=443
+  fi
+  if port_in_use "$_want" || [[ "$_others" == *" $_want "* ]]; then
+    _want=$(pick_vtls_port "$_others") || _want=""
+    echo "[提示] 默认端口也不可用，已自动挑选端口：$_want"
+  fi
+  PORT_VTLS="$_want"
+  save_env
+  echo "[信息] TLS 端口已选定：$PORT_VTLS（装后可用 sbox 菜单「更换端口」随时更改）"
+}
+
 prompt_install_choices() {
   [[ -r /dev/tty ]] || return 0
+  # 0) TLS 端口：首次安装时让用户选（回车/输错默认 443）
+  prompt_vtls_port
   # 1) TLS 域名：当前是脚本自动的临时域名时，给一次手填机会
   if [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]]; then
     local _d="" _tok_asked=0 _fails=0

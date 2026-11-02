@@ -69,6 +69,6 @@ sbox version            # 查看版本
 
 ## 版本
 
-当前版本：**v1.0.4**（变更记录见 [CHANGELOG.md](CHANGELOG.md)，发布包见 GitHub Releases）。
+当前版本：**v1.0.5**（变更记录见 [CHANGELOG.md](CHANGELOG.md)，发布包见 GitHub Releases）。
 一键安装默认拉取最新版（main 分支）；把命令里的 `main` 换成版本号 tag（如 `v1.0.0`）
 即可固定版本安装。

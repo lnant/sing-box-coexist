@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.4"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.5"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -976,7 +976,7 @@ prompt_line_countdown() {
       # 逐字节读不用 read -n：它在切换 termios 时会冲掉输入队列，吃掉首字节
       # （实测域名首字母丢失）。改用 timeout+dd（完全不碰 termios），末尾加
       # 哨兵字节区分「读到的就是换行」与「1 秒无字节」
-      if [[ -n "$_src" ]]; then _raw=$(timeout 1 dd bs=1 count=1 < "$_src" 2>/dev/null; printf '\001'); else _raw=$(timeout 1 dd bs=1 count=1 2>/dev/null; printf '\001'); fi
+      if [[ -n "$_src" ]]; then _raw=$(timeout --foreground 1 dd bs=1 count=1 < "$_src" 2>/dev/null; printf '\001'); else _raw=$(timeout --foreground 1 dd bs=1 count=1 2>/dev/null; printf '\001'); fi
       if [[ "$_raw" == $'\001' ]]; then
         _left=$((_left-1))
         if [[ -z "$_buf" && "$_left" -gt 0 ]]; then
@@ -994,7 +994,7 @@ prompt_line_countdown() {
           if [[ -n "$_src" ]]; then stty -F "$_src" "$_old_stty" 2>/dev/null; else stty "$_old_stty" 2>/dev/null; fi
           kill -TSTP $$ ;;
         $'\033')   # 方向键等转义序列：吞掉后续字节，不进输入
-          if [[ -n "$_src" ]]; then timeout 0.3 dd bs=2 count=1 < "$_src" >/dev/null 2>&1 || true; else timeout 0.3 dd bs=2 count=1 >/dev/null 2>&1 || true; fi ;;
+          if [[ -n "$_src" ]]; then timeout --foreground 0.3 dd bs=2 count=1 < "$_src" >/dev/null 2>&1 || true; else timeout --foreground 0.3 dd bs=2 count=1 >/dev/null 2>&1 || true; fi ;;
         $'\177'|$'\b')
           if [[ -n "$_buf" ]]; then _buf="${_buf%?}"; printf '\b \b' >&2; fi ;;
         $'\004')   # Ctrl-D：空输入按结束处理，有内容则忽略

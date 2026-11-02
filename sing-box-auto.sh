@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.7"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.8"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -951,6 +951,34 @@ domain_a_records() {
   printf '%s' "$_out"
 }
 
+domain_aaaa_records() {
+  local _out
+  _out=$(curl -fsSL --max-time 8 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$1&type=AAAA" 2>/dev/null | jq -r '[.Answer[]? | select(.type==28) | .data] | join(",")' 2>/dev/null || true)
+  if [[ -z "$_out" ]]; then
+    _out=$(curl -fsSL --max-time 8 "https://dns.google/resolve?name=$1&type=AAAA" 2>/dev/null | jq -r '[.Answer[]? | select(.type==28) | .data] | join(",")' 2>/dev/null || true)
+  fi
+  printf '%s' "$_out"
+}
+
+# 本机全部可达地址（前后带空格、空格分隔，一次运行内缓存）：公网查询到的
+# IP（v4 或 v6）+ 网卡上的全部 global 地址。域名解析命中其中任意一个，
+# 才算「解析到本机」。旧实现只认单个公网 IPv4：查不到 v4（如纯 IPv6
+# 机器、查询源抖动）就把「没法验证」当成验证通过，乱填的域名也被采用。
+_LOCAL_IP_SET=""
+local_ip_set() {
+  if [[ -n "$_LOCAL_IP_SET" ]]; then printf '%s' "$_LOCAL_IP_SET"; return 0; fi
+  local _set="" _ip _a
+  _ip=$(get_ip | tr -d '[]')
+  [[ -n "$_ip" ]] && _set="$_ip"
+  if command -v ip >/dev/null 2>&1; then
+    for _a in $(ip -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
+      [[ " $_set " == *" $_a "* ]] || _set="$_set $_a"
+    done
+  fi
+  _LOCAL_IP_SET=" $_set "
+  printf '%s' "$_LOCAL_IP_SET"
+}
+
 # 带倒计时的限时输入：$1=总秒数 $2=提示语 $3=输入来源（/dev/tty 或空=stdin）
 # 读到的整行写入全局 REPLY_LINE；读到非空行返回 0，无输入/直接回车/读完返回 1。
 # 真实终端必须走 raw 逐字读：普通 read 是整行交付，没法在用户敲键期间逐秒
@@ -1070,23 +1098,30 @@ domain_fail_next() {
 # 直连模式（脚本不管理 DNS）下的域名解析验证：$1 必须解析到本机公网 IP。
 # 返回 0=解析正确，或查询源不可用（警告后放行）；1=没解析到本机（报错，由调用方重输）
 validate_domain_points_here() {
-  local _fqdn="$1" _ip _res
-  _ip="$(get_ip)"
-  [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "[警告] 未取得本机公网 IP，跳过域名解析验证"; return 0; }
-  _res=$(domain_a_records "$_fqdn")
-  if [[ -z "$_res" ]]; then
+  local _fqdn="$1" _set _a _aaaa _hit="" _r
+  _set=$(local_ip_set)
+  if [[ -z "${_set// }" ]]; then
+    echo "[警告] 未取得本机任何地址，无法验证域名解析，跳过验证"
+    return 0
+  fi
+  _a=$(domain_a_records "$_fqdn")
+  _aaaa=$(domain_aaaa_records "$_fqdn")
+  if [[ -z "$_a" && -z "$_aaaa" ]]; then
     if [[ -z "$(domain_a_records cloudflare.com)" ]]; then
       echo "[警告] 公共 DNS 查询不可用，跳过域名解析验证"
       return 0
     fi
-    echo "[错误] $_fqdn 目前没有 A 记录解析到本机（本机 IP：$_ip），请先把域名解析到本机，或重新输入"
+    echo "[错误] $_fqdn 目前没有任何解析记录（A/AAAA 均为空），请先把域名解析到本机，或重新输入"
     return 1
   fi
-  if [[ ",$_res," == *",$_ip,"* ]]; then
-    echo "[信息] 域名解析验证通过：$_fqdn → $_ip"
+  for _r in ${_a//,/ } ${_aaaa//,/ }; do
+    if [[ "$_set" == *" $_r "* ]]; then _hit="$_r"; break; fi
+  done
+  if [[ -n "$_hit" ]]; then
+    echo "[信息] 域名解析验证通过：$_fqdn → $_hit"
     return 0
   fi
-  echo "[错误] $_fqdn 当前解析到 $_res，不是本机（本机 IP：$_ip），请先改解析或重新输入"
+  echo "[错误] $_fqdn 当前解析（A：${_a:-无}，AAAA：${_aaaa:-无}）均不是本机地址，请先改解析或重新输入"
   return 1
 }
 

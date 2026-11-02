@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.9"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.10"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 INPUT_TIMEOUT=60                # 输入类等待秒数：60 秒无输入自动按默认走下一步
 CHOICE_TIMEOUT=20               # 选择类等待秒数：20 秒无选择/回车一律取默认选择
 
@@ -1006,7 +1006,7 @@ prompt_line_countdown() {
     fi
   fi
   if [[ "$_is_tty" == "1" ]]; then
-    if [[ -n "$_src" ]]; then stty -icanon -echo -isig < "$_src" 2>/dev/null; else stty -icanon -echo -isig 2>/dev/null; fi
+    if [[ -n "$_src" ]]; then stty -icanon -echo -isig -icrnl < "$_src" 2>/dev/null; else stty -icanon -echo -isig -icrnl 2>/dev/null; fi
     # 逐字节读只用 bash 自带 read，不再借 dd/timeout：timeout 的进程组处理
     # 与部分精简系统（BusyBox 等）的工具差异都曾让 /dev/tty 一个字节都读
     # 不到。read -n 首次调用会冲掉输入队列，先在打印提示前空读一次吸收掉
@@ -1016,6 +1016,8 @@ prompt_line_countdown() {
       if [[ -n "$_src" ]]; then IFS= read -r -n 1 -t 1 _ch < "$_src"; else IFS= read -r -n 1 -t 1 _ch; fi
       _rc=$?
       if [[ $_rc -eq 0 ]]; then
+        # read -n 读到换行时可能把它当分隔符吞掉、返回空字符：空字符即回车
+        [[ -z "$_ch" ]] && break
         case "$_ch" in
           $'\n'|$'\r') break ;;
           $'\003')   # Ctrl-C：先恢复终端再自发中断信号，保持原有行为

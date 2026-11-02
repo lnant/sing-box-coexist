@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.2"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.3"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -940,6 +940,58 @@ domain_a_records() {
   printf '%s' "$_out"
 }
 
+# 带倒计时的限时输入：$1=总秒数 $2=提示语 $3=输入来源（/dev/tty 或空=stdin）
+# 读到的整行写入全局 REPLY_LINE；读到非空行返回 0，无输入/直接回车/读完返回 1。
+# 倒计时只在尚未输入任何字符时刷新本行，用户开始输入后不再干扰其输入显示
+prompt_line_countdown() {
+  local _secs="$1" _prompt="$2" _src="${3:-}" _chunk="" _i _rc
+  REPLY_LINE=""
+  for (( _i=_secs; _i>0; _i-- )); do
+    if [[ -z "$REPLY_LINE" && -z "$_chunk" ]]; then
+      printf '\r%s（还剩 %d 秒）' "$_prompt" "$_i" >&2
+    fi
+    if [[ -n "$_src" ]]; then
+      read -t 1 -r _chunk < "$_src"
+    else
+      read -t 1 -r _chunk
+    fi
+    _rc=$?
+    REPLY_LINE+="${_chunk}"
+    if [[ $_rc -eq 0 ]]; then
+      printf '\n' >&2
+      [[ -n "$REPLY_LINE" ]] && return 0
+      return 1   # 直接回车（空行）
+    fi
+    # 超时（rc≥128）时片读到的部分输入已赋给 _chunk，继续累积；EOF 等真实错误按无输入处理
+    if [[ $_rc -lt 128 ]]; then
+      printf '\n' >&2
+      return 1
+    fi
+  done
+  printf '\n' >&2
+  [[ -n "$REPLY_LINE" ]] && return 0
+  return 1
+}
+
+# 域名校验失败后的统一处理：$1=累计失败次数 $2=启用临时域名后的提示后缀 $3=输入来源
+# 返回 0=用户选择重新输入；返回 1=用默认（3 次失败直接启用临时域名；
+# 未满 3 次时让用户选，10 秒不选自动默认）
+domain_fail_next() {
+  local _fails="$1" _suffix="$2" _src="${3:-}" _c=""
+  if [[ "$_fails" -ge 3 ]]; then
+    echo "[提示] 域名未正确解析（连续 3 次未通过校验），已启用临时域名。$_suffix"
+    return 1
+  fi
+  echo "[选择] 1) 重新输入  2) 使用默认域名（10 秒内不选，自动用默认域名）"
+  if [[ -n "$_src" ]]; then
+    read -t 10 -r -p "请选择 [1/2]: " _c < "$_src" || _c=""
+  else
+    read -t 10 -r -p "请选择 [1/2]: " _c || _c=""
+  fi
+  [[ "$_c" == "1" ]] && return 0
+  return 1
+}
+
 # 直连模式（脚本不管理 DNS）下的域名解析验证：$1 必须解析到本机公网 IP。
 # 返回 0=解析正确，或查询源不可用（警告后放行）；1=没解析到本机（报错，由调用方重输）
 validate_domain_points_here() {
@@ -967,28 +1019,73 @@ prompt_install_choices() {
   [[ -r /dev/tty ]] || return 0
   # 1) TLS 域名：当前是脚本自动的临时域名时，给一次手填机会
   if [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]]; then
-    local _d=""
+    local _d="" _tok_asked=0 _fails=0
+    echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
     while true; do
-      echo "[可选] 10 秒内输入 TLS 域名，超时/直接回车自动用临时域名：${TLS_DOMAIN}"
-      if read -t 10 -r -p "TLS 域名: " _d </dev/tty && [[ -n "$_d" ]]; then
-        _d=$(clean_domain "$_d")
-        if valid_domain_format "$_d"; then
-          # 安装时手填的域名走直连：必须已解析到本机，否则先报错重输
-          if ! validate_domain_points_here "$_d"; then
+      if prompt_line_countdown 15 "TLS 域名（无输入自动用临时域名 ${TLS_DOMAIN}）: " /dev/tty; then
+        _d=$(clean_domain "$REPLY_LINE")
+        if ! valid_domain_format "$_d"; then
+          echo "[错误] 域名格式不对（示例：node.example.com）"
+          _fails=$((_fails+1))
+          if domain_fail_next "$_fails" "安装完成后随时可以更改（运行 sbox change-domain）。" /dev/tty; then
             continue
+          fi
+          break
+        fi
+        # Token 只问一次：已保存的直接用；没有就给一次 10 秒填入机会，
+        # 有 Token 时与 change-domain 走同一套深度验证 + 装时直接申请真证书
+        if [[ "$_tok_asked" == "0" ]]; then
+          _tok_asked=1
+          load_cf_token || true
+          if [[ -z "${CF_API_TOKEN:-}" ]]; then
+            read -t 10 -r -p "Cloudflare API Token（申请真证书并套 CF；直接回车跳过，用自签直连）: " CF_API_TOKEN </dev/tty || CF_API_TOKEN=""
+          fi
+          if [[ -n "${CF_API_TOKEN:-}" && ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "[警告] Token 含非法字符（Cloudflare API Token 只应含字母、数字、_ 与 -），已忽略，按自签直连处理"
+            CF_API_TOKEN=""
+          fi
+          [[ -n "${CF_API_TOKEN:-}" ]] && save_cf_token
+        fi
+        if [[ -n "${CF_API_TOKEN:-}" ]]; then
+          if ! validate_cf_domain "$_d"; then
+            _fails=$((_fails+1))
+            if domain_fail_next "$_fails" "安装完成后随时可以更改（运行 sbox change-domain）。" /dev/tty; then
+              continue
+            fi
+            break
           fi
           cf_delete_managed_record   # 若临时域名是脚本在 CF 建的记录，先清掉再换
           TLS_DOMAIN="$_d"
           TLS_DOMAIN_AUTO=0
           TLS_ACME=0
           save_env
-          echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
+          if cf_setup_domain "$TLS_DOMAIN"; then
+            TLS_ACME=1
+            save_env
+            echo "[信息] 已采用域名：$TLS_DOMAIN（真证书，安装完成后自动签发并验证）"
+          else
+            echo "[警告] Cloudflare 设置未完成，已回退自签证书直连"
+            echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
+          fi
           break
         fi
-        echo "[错误] 域名格式不对（示例：node.example.com），请重新输入；不输入则 10 秒后自动用临时域名"
-        continue
+        # 无 Token 直连：域名必须已解析到本机，否则先报错重输
+        if ! validate_domain_points_here "$_d"; then
+          _fails=$((_fails+1))
+          if domain_fail_next "$_fails" "安装完成后随时可以更改（运行 sbox change-domain）。" /dev/tty; then
+            continue
+          fi
+          break
+        fi
+        cf_delete_managed_record   # 若临时域名是脚本在 CF 建的记录，先清掉再换
+        TLS_DOMAIN="$_d"
+        TLS_DOMAIN_AUTO=0
+        TLS_ACME=0
+        save_env
+        echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
+        break
       fi
-      break   # 超时或直接回车：按默认用临时域名，不再问
+      break   # 无输入/直接回车：按默认用临时域名，不再问
     done
   fi
   # 2) Argo 固定隧道：还没配置过时给一次填 Token 的机会，默认临时隧道
@@ -1539,6 +1636,49 @@ do_change_cert() {
   echo "[完成] 自签证书已更新（Hy2/TUIC/AnyTLS/VMess-WS 已切换新证书）"
 }
 
+# ACME 模式下等待签发并验证域名链握手（调用前需已 setup_service）；
+# 失败自动回退自签，绝不留一条死链。change-domain 与安装流程共用
+acme_verify_or_fallback() {
+  [[ "${TLS_ACME:-0}" == "1" ]] || return 0
+  # ACME 首次签发要等 DNS-01 验证，最长约 2 分钟；验证域名链真的能握手
+  echo "[信息] 等待 Let's Encrypt 签发证书（DNS-01 验证，最长约 2 分钟）…"
+  local _ok=0 _i _code
+  for _i in $(seq 1 40); do
+    sleep 3
+    # 注意：WS 握手成功（101）后连接保持开启，curl 会以超时退出（28）——
+    # 不能把 curl 放进受 pipefail 影响的管道里判断，必须先捕获状态码再比较
+    _code=$(curl -s --max-time 5 --resolve "${TLS_DOMAIN}:${PORT_VTLS}:127.0.0.1" \
+         "https://${TLS_DOMAIN}:${PORT_VTLS}/${UUID}-vt" \
+         -H "Connection: Upgrade" -H "Upgrade: websocket" \
+         -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
+         -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+    if [[ "$_code" == "101" ]]; then
+      _ok=1
+      break
+    fi
+  done
+  if [[ "$_ok" == "1" ]]; then
+    echo "[完成] 真证书已签发，域名 TLS 链已通过 WebSocket 握手验证"
+    return 0
+  fi
+  echo "[警告] 证书签发或握手验证未通过（sing-box 日志：journalctl -u $UNIT -n 20），自动回退自签证书"
+  TLS_ACME=0
+  save_env
+  # 回退自签后 Cloudflare 若仍是「完全（严格）」会因源站证书不受信报 526，同步降为「完全」
+  if [[ -f "$CF_ENV_FILE" ]] && load_cf_token; then
+    local _zid_fb
+    _zid_fb=$(grep '^CF_ZONE_ID=' "$CF_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+    if [[ -n "$_zid_fb" ]]; then
+      cf_api PATCH "/zones/$_zid_fb/settings/ssl" '{"value":"full"}' >/dev/null 2>&1 || true
+      echo "[信息] 已同步把 Cloudflare SSL 模式降为「完全」，与自签证书匹配"
+    fi
+  fi
+  rm -f "$SB_DIR/cert.pem" "$SB_DIR/private.key"
+  gen_certs
+  write_config
+  setup_service
+}
+
 # 更换 TLS 域名：可换回自动临时域名，或换成自己的真域名并（可选）申请
 # Let's Encrypt 真证书（sing-box 内置 ACME + Cloudflare DNS-01）+ 套 Cloudflare
 do_change_domain() {
@@ -1548,22 +1688,23 @@ do_change_domain() {
   local _auto_desc="手动设置"
   [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]] && _auto_desc="自动生成的临时域名"
   echo "当前 TLS 域名：${TLS_DOMAIN:-（未设置）}（$_auto_desc，证书：$_cert_desc，端口：${PORT_VTLS:-}）"
-  local _d="" _tok_asked=0
+  echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
+  local _d="" _tok_asked=0 _fails=0 _use_default=0
   while true; do
-    # 10 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
-    read -t 10 -rp "输入新域名（10 秒内无输入/直接回车 = 重新自动生成临时域名）: " _d || _d=""
-    if [[ -z "$_d" ]]; then
-      cf_delete_managed_record   # 旧域名若是脚本在 CF 建的记录，先删再换，避免残留
-      TLS_DOMAIN=""
-      TLS_ACME=0
-      TLS_DOMAIN_AUTO=1
-      ensure_tls_domain
+    # 15 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
+    if ! prompt_line_countdown 15 "输入新域名（无输入 = 重新自动生成临时域名）: "; then
+      _use_default=1
       break
     fi
-    _d=$(clean_domain "$_d")
+    _d=$(clean_domain "$REPLY_LINE")
     if ! valid_domain_format "$_d"; then
-      echo "[错误] 域名格式不对（示例：node.example.com），请重新输入；不输入则 10 秒后按默认自动生成临时域名"
-      continue
+      echo "[错误] 域名格式不对（示例：node.example.com）"
+      _fails=$((_fails+1))
+      if domain_fail_next "$_fails" "可随时再次运行 sbox change-domain 更改。"; then
+        continue
+      fi
+      _use_default=1
+      break
     fi
     # Token 只问一次：验证不过、重新输入域名时不重复问
     if [[ "$_tok_asked" == "0" ]]; then
@@ -1581,12 +1722,22 @@ do_change_domain() {
       save_cf_token
       # 深度验证（归属/NS/冲突/DNS-01 预检）：不过就报错并重新输入域名，不动现有配置
       if ! validate_cf_domain "$_d"; then
-        continue
+        _fails=$((_fails+1))
+        if domain_fail_next "$_fails" "可随时再次运行 sbox change-domain 更改。"; then
+          continue
+        fi
+        _use_default=1
+        break
       fi
     else
       # 无 Token 直连：脚本不管理 DNS，域名必须自己解析到本机，否则生成的链接是死的
       if ! validate_domain_points_here "$_d"; then
-        continue
+        _fails=$((_fails+1))
+        if domain_fail_next "$_fails" "可随时再次运行 sbox change-domain 更改。"; then
+          continue
+        fi
+        _use_default=1
+        break
       fi
     fi
     TLS_DOMAIN="$_d"
@@ -1602,6 +1753,13 @@ do_change_domain() {
     fi
     break
   done
+  if [[ "$_use_default" == "1" ]]; then
+    cf_delete_managed_record   # 旧域名若是脚本在 CF 建的记录，先删再换，避免残留
+    TLS_DOMAIN=""
+    TLS_ACME=0
+    TLS_DOMAIN_AUTO=1
+    ensure_tls_domain
+  fi
   save_env
   if [[ "${TLS_ACME:-0}" != "1" ]]; then
     # 自签模式下新域名要进证书 SAN，重签一次（ACME 模式下域名链不使用这张证书）
@@ -1611,46 +1769,7 @@ do_change_domain() {
   write_config
   open_firewall
   setup_service
-  if [[ "${TLS_ACME:-0}" == "1" ]]; then
-    # ACME 首次签发要等 DNS-01 验证，最长约 2 分钟；验证域名链真的能握手，
-    # 失败自动回退自签，绝不留一条死链
-    echo "[信息] 等待 Let's Encrypt 签发证书（DNS-01 验证，最长约 2 分钟）…"
-    local _ok=0 _i _code
-    for _i in $(seq 1 40); do
-      sleep 3
-      # 注意：WS 握手成功（101）后连接保持开启，curl 会以超时退出（28）——
-      # 不能把 curl 放进受 pipefail 影响的管道里判断，必须先捕获状态码再比较
-      _code=$(curl -s --max-time 5 --resolve "${TLS_DOMAIN}:${PORT_VTLS}:127.0.0.1" \
-           "https://${TLS_DOMAIN}:${PORT_VTLS}/${UUID}-vt" \
-           -H "Connection: Upgrade" -H "Upgrade: websocket" \
-           -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
-           -o /dev/null -w '%{http_code}' 2>/dev/null || true)
-      if [[ "$_code" == "101" ]]; then
-        _ok=1
-        break
-      fi
-    done
-    if [[ "$_ok" == "1" ]]; then
-      echo "[完成] 真证书已签发，域名 TLS 链已通过 WebSocket 握手验证"
-    else
-      echo "[警告] 证书签发或握手验证未通过（sing-box 日志：journalctl -u $UNIT -n 20），自动回退自签证书"
-      TLS_ACME=0
-      save_env
-      # 回退自签后 Cloudflare 若仍是「完全（严格）」会因源站证书不受信报 526，同步降为「完全」
-      if [[ -f "$CF_ENV_FILE" ]] && load_cf_token; then
-        local _zid_fb
-        _zid_fb=$(grep '^CF_ZONE_ID=' "$CF_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
-        if [[ -n "$_zid_fb" ]]; then
-          cf_api PATCH "/zones/$_zid_fb/settings/ssl" '{"value":"full"}' >/dev/null 2>&1 || true
-          echo "[信息] 已同步把 Cloudflare SSL 模式降为「完全」，与自签证书匹配"
-        fi
-      fi
-      rm -f "$SB_DIR/cert.pem" "$SB_DIR/private.key"
-      gen_certs
-      write_config
-      setup_service
-    fi
-  fi
+  acme_verify_or_fallback
   print_links
   echo
   echo "[完成] TLS 域名已更新：$TLS_DOMAIN"
@@ -1966,6 +2085,7 @@ case "$ACTION" in
     open_firewall
     fix_selinux
     setup_service
+    acme_verify_or_fallback
     start_argo
     print_links
     echo

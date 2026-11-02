@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.0"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.1"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -883,7 +883,7 @@ write_config() {
       _tok=$(grep '^CF_API_TOKEN=' "$CF_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
     fi
     if [[ -n "$_tok" ]]; then
-      vtls_tls="\"enabled\": true, \"server_name\": \"$_tls_sni\", \"acme\": {\"domain\": [\"$_tls_sni\"], \"data_directory\": \"$SB_DIR/acme\", \"email\": \"admin@$_tls_sni\", \"provider\": \"letsencrypt\", \"disable_http_challenge\": true, \"disable_tls_alpn_challenge\": true, \"dns01_challenge\": {\"provider\": \"cloudflare\", \"api_token\": \"$_tok\"}}"
+      vtls_tls="\"enabled\": true, \"server_name\": \"$_tls_sni\", \"certificate_provider\": {\"type\": \"acme\", \"domain\": [\"$_tls_sni\"], \"data_directory\": \"$SB_DIR/acme\", \"email\": \"admin@$_tls_sni\", \"provider\": \"letsencrypt\", \"disable_http_challenge\": true, \"disable_tls_alpn_challenge\": true, \"dns01_challenge\": {\"provider\": \"cloudflare\", \"api_token\": \"$_tok\"}}"
     else
       # 状态不一致兜底（ACME 开着但 Token 丢失）：宁可降级自签，也不能生成坏配置
       echo "[警告] ACME 已启用但读不到 Cloudflare Token，域名 TLS 链暂用自签证书"
@@ -1450,14 +1450,17 @@ do_change_domain() {
     # ACME 首次签发要等 DNS-01 验证，最长约 2 分钟；验证域名链真的能握手，
     # 失败自动回退自签，绝不留一条死链
     echo "[信息] 等待 Let's Encrypt 签发证书（DNS-01 验证，最长约 2 分钟）…"
-    local _ok=0 _i
+    local _ok=0 _i _code
     for _i in $(seq 1 40); do
       sleep 3
-      if curl -s --max-time 5 --resolve "${TLS_DOMAIN}:${PORT_VTLS}:127.0.0.1" \
+      # 注意：WS 握手成功（101）后连接保持开启，curl 会以超时退出（28）——
+      # 不能把 curl 放进受 pipefail 影响的管道里判断，必须先捕获状态码再比较
+      _code=$(curl -s --max-time 5 --resolve "${TLS_DOMAIN}:${PORT_VTLS}:127.0.0.1" \
            "https://${TLS_DOMAIN}:${PORT_VTLS}/${UUID}-vt" \
            -H "Connection: Upgrade" -H "Upgrade: websocket" \
            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
-           -o /dev/null -w '%{http_code}' 2>/dev/null | grep -q '^101$'; then
+           -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+      if [[ "$_code" == "101" ]]; then
         _ok=1
         break
       fi

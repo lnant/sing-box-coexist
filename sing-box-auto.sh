@@ -31,7 +31,7 @@
 #     sbox change-domain 换域名（可同时申请真证书并套 Cloudflare），
 #     sbox change-argo 切换固定/临时隧道
 #   - 随机端口：新装时 5 个协议端口在 10000-60000 内随机分配（互不冲突，避开已占用），
-#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 5 可手动改
+#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 6 可手动改
 #   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
 #     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
@@ -51,7 +51,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.1"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.0.2"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 
 # version 动作只打印版本，不需要 root / 已安装，提前处理
 if [[ "$ACTION" == "version" ]]; then
@@ -616,6 +616,96 @@ cf_zone_for_domain() {
   return 1
 }
 
+# 检查 zone 的 NS 是否已真正委托到 Cloudflare：返回 0=已委托，1=未委托，2=没查成
+cf_zone_ns_check() {
+  local _zid="$1" _zname="$2" _resp _assigned _public _ns
+  _resp=$(cf_api GET "/zones/$_zid") || return 2
+  _assigned=$(printf '%s' "$_resp" | jq -r '.result.name_servers[]? // empty' 2>/dev/null | sed 's/\.$//' || true)
+  [[ -n "$_assigned" ]] || return 2
+  _public=$(curl -fsSL --max-time 10 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$_zname&type=NS" 2>/dev/null | jq -r '.Answer[]?.data // empty' 2>/dev/null | sed 's/\.$//' || true)
+  if [[ -z "$_public" ]]; then
+    _public=$(curl -fsSL --max-time 10 "https://dns.google/resolve?name=$_zname&type=NS" 2>/dev/null | jq -r '.Answer[]?.data // empty' 2>/dev/null | sed 's/\.$//' || true)
+  fi
+  [[ -n "$_public" ]] || return 2
+  while IFS= read -r _ns; do
+    [[ -n "$_ns" ]] || continue
+    if printf '%s\n' "$_public" | grep -qix "$_ns"; then
+      return 0
+    fi
+  done <<< "$_assigned"
+  return 1
+}
+
+# 列出 $2 上已有的 A/AAAA/CNAME 记录中「不指向本机 IP」的，输出摘要（空=无冲突）
+cf_domain_conflicts() {
+  local _zid="$1" _fqdn="$2" _ip="$3" _resp
+  _resp=$(cf_api GET "/zones/$_zid/dns_records?name=$_fqdn&per_page=100") || { printf ''; return 0; }
+  printf '%s' "$_resp" | jq -r --arg ip "$_ip" '[.result[] | select(.type=="A" or .type=="AAAA" or .type=="CNAME") | select(.content != $ip) | "\(.type)→\(.content)"] | join("；")' 2>/dev/null || true
+}
+
+# 删除 $2 上与本机 IP 冲突的 A/AAAA/CNAME 记录（用户在冲突提示里确认覆盖后调用）
+cf_delete_conflicting_records() {
+  local _zid="$1" _fqdn="$2" _ip="$3" _resp _rid
+  _resp=$(cf_api GET "/zones/$_zid/dns_records?name=$_fqdn&per_page=100") || return 0
+  while IFS= read -r _rid; do
+    [[ -n "$_rid" ]] || continue
+    cf_api DELETE "/zones/$_zid/dns_records/$_rid" >/dev/null 2>&1 || true
+  done < <(printf '%s' "$_resp" | jq -r --arg ip "$_ip" '.result[] | select(.type=="A" or .type=="AAAA" or .type=="CNAME") | select(.content != $ip) | .id' 2>/dev/null || true)
+}
+
+# DNS-01 预检：在 _acme-challenge.$2 写一条随机 TXT，从公网 DNS 确认可见后删除；
+# 可见返回 0（签发链大概率能走通），超时未见返回 1
+cf_dns01_precheck() {
+  local _zid="$1" _fqdn="$2" _name="_acme-challenge.$_fqdn" _val _resp _rid _i _seen=""
+  _val="sbox-precheck-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  _resp=$(cf_api POST "/zones/$_zid/dns_records" "{\"type\":\"TXT\",\"name\":\"$_name\",\"content\":\"$_val\",\"ttl\":60}") || return 1
+  _rid=$(printf '%s' "$_resp" | jq -r '.result.id // empty' 2>/dev/null || true)
+  [[ -n "$_rid" ]] || return 1
+  for _i in $(seq 1 12); do
+    sleep 5
+    _seen=$(curl -fsSL --max-time 8 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$_name&type=TXT" 2>/dev/null | jq -r '.Answer[]?.data // empty' 2>/dev/null | tr -d '"' || true)
+    if [[ "$_seen" == *"$_val"* ]]; then
+      break
+    fi
+    _seen=""
+  done
+  cf_api DELETE "/zones/$_zid/dns_records/$_rid" >/dev/null 2>&1 || true
+  [[ -n "$_seen" ]]
+}
+
+# 换域名前的深度验证（有 CF Token 时）：zone 归属、NS 委托、现有解析冲突、
+# DNS-01 预检；全部通过返回 0，任何一项不过打印原因返回 1（调用方重新让用户输入）
+validate_cf_domain() {
+  local _fqdn="$1" _z _zid _zname _nsrc _conf _ans _ip
+  _z=$(cf_zone_for_domain "$_fqdn") || { echo "[错误] 在 Cloudflare 账号里找不到 $_fqdn 所属的已激活域名（确认域名已托管到该账号），请重新输入"; return 1; }
+  _zid="${_z%%$'\t'*}"
+  _zname="${_z##*$'\t'}"
+  cf_zone_ns_check "$_zid" "$_zname"; _nsrc=$?
+  if [[ "$_nsrc" == "1" ]]; then
+    echo "[错误] $_zname 的 NS 还没有指到 Cloudflare（先在域名注册商处改成 Cloudflare 分配的 NS），请重新输入"
+    return 1
+  elif [[ "$_nsrc" == "2" ]]; then
+    echo "[警告] NS 委托状态没查成（公共 DNS 查询失败），继续往下验证"
+  fi
+  _ip="$(get_ip)"
+  _conf=$(cf_domain_conflicts "$_zid" "$_fqdn" "$_ip")
+  if [[ -n "$_conf" ]]; then
+    echo "[警告] $_fqdn 已有解析记录：$_conf"
+    read -t 10 -rp "输入 y 覆盖这些记录并继续，其他输入/10 秒无输入 = 重新输入域名: " _ans || _ans=""
+    if [[ "$_ans" != "y" && "$_ans" != "Y" ]]; then
+      return 1
+    fi
+    cf_delete_conflicting_records "$_zid" "$_fqdn" "$_ip"
+  fi
+  echo "[信息] 正在做 DNS-01 预检（写入测试 TXT 记录并从公网确认）…"
+  if ! cf_dns01_precheck "$_zid" "$_fqdn"; then
+    echo "[错误] DNS-01 预检未通过：测试 TXT 记录写入后公网查不到（多半是 NS 委托或传播问题），证书大概率签不下来，请重新输入"
+    return 1
+  fi
+  echo "[信息] 域名验证通过：$_fqdn（归属、NS、DNS-01 预检均正常）"
+  return 0
+}
+
 # 把 $2 的 A 记录指向 $3 并开橙色云代理；输出 record_id
 cf_upsert_a_record() {
   local _zid="$1" _fqdn="$2" _ip="$3" _resp _rid _body
@@ -828,24 +918,78 @@ load_or_gen_identity() {
 # 只在有控制终端时出现，每题等 10 秒：无终端（curl|bash、远程无 tty、定时任务）
 # 或超时未输入，一律走已生成的默认——TLS 域名默认临时域名、隧道默认临时隧道，
 # 全程静默不受影响；填了的值事后都能改（change-domain / change-argo）。
+# 清理用户输入的域名：去空白、协议头、路径与尾点，并转小写（粘贴时常带这些）
+clean_domain() {
+  printf '%s' "$1" | tr -d '[:space:]' | sed -e 's#^[A-Za-z][A-Za-z0-9+.-]*://##' -e 's#/.*$##' -e 's/\.$//' | tr 'A-Z' 'a-z'
+}
+
+# 域名格式校验：至少两段，每段字母数字开头结尾、中间可含连字符，总长 ≤253
+valid_domain_format() {
+  local d="$1"
+  [[ ${#d} -le 253 ]] || return 1
+  [[ "$d" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
+}
+
+# 公共 DNS 查 $1 的 A 记录，输出逗号分隔的 IP 列表（无记录/查询失败输出空）
+domain_a_records() {
+  local _out
+  _out=$(curl -fsSL --max-time 8 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$1&type=A" 2>/dev/null | jq -r '[.Answer[]? | select(.type==1) | .data] | join(",")' 2>/dev/null || true)
+  if [[ -z "$_out" ]]; then
+    _out=$(curl -fsSL --max-time 8 "https://dns.google/resolve?name=$1&type=A" 2>/dev/null | jq -r '[.Answer[]? | select(.type==1) | .data] | join(",")' 2>/dev/null || true)
+  fi
+  printf '%s' "$_out"
+}
+
+# 直连模式（脚本不管理 DNS）下的域名解析验证：$1 必须解析到本机公网 IP。
+# 返回 0=解析正确，或查询源不可用（警告后放行）；1=没解析到本机（报错，由调用方重输）
+validate_domain_points_here() {
+  local _fqdn="$1" _ip _res
+  _ip="$(get_ip)"
+  [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "[警告] 未取得本机公网 IP，跳过域名解析验证"; return 0; }
+  _res=$(domain_a_records "$_fqdn")
+  if [[ -z "$_res" ]]; then
+    if [[ -z "$(domain_a_records cloudflare.com)" ]]; then
+      echo "[警告] 公共 DNS 查询不可用，跳过域名解析验证"
+      return 0
+    fi
+    echo "[错误] $_fqdn 目前没有 A 记录解析到本机（本机 IP：$_ip），请先把域名解析到本机，或重新输入"
+    return 1
+  fi
+  if [[ ",$_res," == *",$_ip,"* ]]; then
+    echo "[信息] 域名解析验证通过：$_fqdn → $_ip"
+    return 0
+  fi
+  echo "[错误] $_fqdn 当前解析到 $_res，不是本机（本机 IP：$_ip），请先改解析或重新输入"
+  return 1
+}
+
 prompt_install_choices() {
   [[ -r /dev/tty ]] || return 0
   # 1) TLS 域名：当前是脚本自动的临时域名时，给一次手填机会
   if [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]]; then
     local _d=""
-    echo "[可选] 10 秒内输入 TLS 域名，超时/直接回车自动用临时域名：${TLS_DOMAIN}"
-    if read -t 10 -r -p "TLS 域名: " _d </dev/tty && [[ -n "$_d" ]]; then
-      if [[ "$_d" =~ ^[A-Za-z0-9.-]+$ && "$_d" == *.* && "$_d" != .* && "$_d" != *. ]]; then
-        cf_delete_managed_record   # 若临时域名是脚本在 CF 建的记录，先清掉再换
-        TLS_DOMAIN="$_d"
-        TLS_DOMAIN_AUTO=0
-        TLS_ACME=0
-        save_env
-        echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
-      else
-        echo "[警告] 域名格式不对，继续用临时域名：${TLS_DOMAIN}"
+    while true; do
+      echo "[可选] 10 秒内输入 TLS 域名，超时/直接回车自动用临时域名：${TLS_DOMAIN}"
+      if read -t 10 -r -p "TLS 域名: " _d </dev/tty && [[ -n "$_d" ]]; then
+        _d=$(clean_domain "$_d")
+        if valid_domain_format "$_d"; then
+          # 安装时手填的域名走直连：必须已解析到本机，否则先报错重输
+          if ! validate_domain_points_here "$_d"; then
+            continue
+          fi
+          cf_delete_managed_record   # 若临时域名是脚本在 CF 建的记录，先清掉再换
+          TLS_DOMAIN="$_d"
+          TLS_DOMAIN_AUTO=0
+          TLS_ACME=0
+          save_env
+          echo "[信息] 已采用域名：$TLS_DOMAIN（自签证书；装后运行 sbox change-domain 可申请真证书并套 Cloudflare）"
+          break
+        fi
+        echo "[错误] 域名格式不对（示例：node.example.com），请重新输入；不输入则 10 秒后自动用临时域名"
+        continue
       fi
-    fi
+      break   # 超时或直接回车：按默认用临时域名，不再问
+    done
   fi
   # 2) Argo 固定隧道：还没配置过时给一次填 Token 的机会，默认临时隧道
   if [[ ! -f "$SB_DIR/argo.env" ]]; then
@@ -1404,23 +1548,27 @@ do_change_domain() {
   local _auto_desc="手动设置"
   [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]] && _auto_desc="自动生成的临时域名"
   echo "当前 TLS 域名：${TLS_DOMAIN:-（未设置）}（$_auto_desc，证书：$_cert_desc，端口：${PORT_VTLS:-}）"
-  local _d=""
-  read -rp "输入新域名（直接回车 = 重新自动生成临时域名）: " _d
-  cf_delete_managed_record   # 旧域名若是脚本在 CF 建的记录，先删再换，避免残留
-  if [[ -z "$_d" ]]; then
-    TLS_DOMAIN=""
-    TLS_ACME=0
-    TLS_DOMAIN_AUTO=1
-    ensure_tls_domain
-  else
-    if [[ ! "$_d" =~ ^[A-Za-z0-9.-]+$ || "$_d" != *.* || "$_d" == .* || "$_d" == *. ]]; then
-      echo "[错误] 域名格式不对（示例：node.example.com），未做任何修改"
-      return 0
+  local _d="" _tok_asked=0
+  while true; do
+    # 10 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
+    read -t 10 -rp "输入新域名（10 秒内无输入/直接回车 = 重新自动生成临时域名）: " _d || _d=""
+    if [[ -z "$_d" ]]; then
+      cf_delete_managed_record   # 旧域名若是脚本在 CF 建的记录，先删再换，避免残留
+      TLS_DOMAIN=""
+      TLS_ACME=0
+      TLS_DOMAIN_AUTO=1
+      ensure_tls_domain
+      break
     fi
-    TLS_DOMAIN="$_d"
-    TLS_DOMAIN_AUTO=0
-    TLS_ACME=0
-    load_cf_token || true
+    _d=$(clean_domain "$_d")
+    if ! valid_domain_format "$_d"; then
+      echo "[错误] 域名格式不对（示例：node.example.com），请重新输入；不输入则 10 秒后按默认自动生成临时域名"
+      continue
+    fi
+    # Token 只问一次：验证不过、重新输入域名时不重复问
+    if [[ "$_tok_asked" == "0" ]]; then
+      _tok_asked=1
+      load_cf_token || true
     if [[ -z "${CF_API_TOKEN:-}" ]]; then
       read -rp "Cloudflare API Token（申请真证书并套 CF；直接回车跳过，用自签直连）: " CF_API_TOKEN || CF_API_TOKEN=""
     fi
@@ -1428,15 +1576,32 @@ do_change_domain() {
       echo "[警告] Token 含非法字符（Cloudflare API Token 只应含字母、数字、_ 与 -），已忽略，按自签直连处理"
       CF_API_TOKEN=""
     fi
+    fi
     if [[ -n "${CF_API_TOKEN:-}" ]]; then
       save_cf_token
+      # 深度验证（归属/NS/冲突/DNS-01 预检）：不过就报错并重新输入域名，不动现有配置
+      if ! validate_cf_domain "$_d"; then
+        continue
+      fi
+    else
+      # 无 Token 直连：脚本不管理 DNS，域名必须自己解析到本机，否则生成的链接是死的
+      if ! validate_domain_points_here "$_d"; then
+        continue
+      fi
+    fi
+    TLS_DOMAIN="$_d"
+    TLS_DOMAIN_AUTO=0
+    TLS_ACME=0
+    cf_delete_managed_record   # 验证通过后才清理旧域名的脚本记录
+    if [[ -n "${CF_API_TOKEN:-}" ]]; then
       if cf_setup_domain "$TLS_DOMAIN"; then
         TLS_ACME=1
       else
         echo "[警告] Cloudflare 设置未完成，已回退自签证书直连"
       fi
     fi
-  fi
+    break
+  done
   save_env
   if [[ "${TLS_ACME:-0}" != "1" ]]; then
     # 自签模式下新域名要进证书 SAN，重签一次（ACME 模式下域名链不使用这张证书）
@@ -1749,30 +1914,30 @@ show_menu() {
     echo
     echo "1. 查看节点链接"
     echo "2. 重启 sing-box 服务"
-    echo "3. 更换 UUID（全协议）"
-    echo "4. 更换端口"
-    echo "5. 更新 Reality 密钥对"
-    echo "6. 更新自签证书"
-    echo "7. Argo 隧道管理"
-    echo "8. 更新 sing-box 内核到最新版"
-    echo "9. 更新脚本到最新版"
-    echo "10. 卸载"
-    echo "11. 更换 TLS 域名（可申请真证书/套 Cloudflare）"
+    echo "3. 更换 TLS 域名（可申请真证书/套 Cloudflare）"
+    echo "4. Argo 隧道管理"
+    echo "5. 更换 UUID（全协议）"
+    echo "6. 更换端口"
+    echo "7. 更新 Reality 密钥对"
+    echo "8. 更新自签证书"
+    echo "9. 更新 sing-box 内核到最新版"
+    echo "10. 更新脚本到最新版"
+    echo "11. 卸载"
     echo "0. 退出"
     echo "==================================================="
     read -rp "请选择 [0-11]: " choice
     case "$choice" in
       1) load_env_or_exit; print_links ;;
       2) load_env_or_exit; setup_service; echo "[完成] 服务已重启" ;;
-      3) do_change_uuid ;;
-      4) do_change_ports ;;
-      5) do_change_reality ;;
-      6) do_change_cert ;;
-      7) do_argo_menu ;;
-      8) detect_arch; if ! do_update_core; then echo "[提示] 内核更新未完成，见上方信息"; fi ;;
-      9) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
-      10) do_uninstall; break ;;
-      11) do_change_domain ;;
+      3) do_change_domain ;;
+      4) do_argo_menu ;;
+      5) do_change_uuid ;;
+      6) do_change_ports ;;
+      7) do_change_reality ;;
+      8) do_change_cert ;;
+      9) detect_arch; if ! do_update_core; then echo "[提示] 内核更新未完成，见上方信息"; fi ;;
+      10) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
+      11) do_uninstall; break ;;
       0) echo "退出"; break ;;
       *) echo "[错误] 无效选择" ;;
     esac

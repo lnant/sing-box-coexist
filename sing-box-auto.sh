@@ -18,7 +18,8 @@
 #   管理菜单：curl -fsSL https://raw.githubusercontent.com/lnant/sing-box-coexist/main/sing-box-auto.sh | sudo bash -s -- menu
 #   （或下载后 sudo bash sing-box-auto.sh menu）
 #   动作参数：menu | change-uuid | change-reality | change-cert | change-argo
-#            | change-domain | change-ports | show-links | restart | uninstall
+#            | change-warp | warp-reroll | change-domain | change-ports
+#            | show-links | restart | uninstall
 #            | update-script | update-core | version
 #   快捷命令：安装时会自动装好 sbox 命令（/usr/local/bin/sbox），之后直接打
 #            sbox 就进管理菜单（非 root 会自动 sudo 提权），sbox <动作> 执行对应操作
@@ -31,7 +32,7 @@
 #     sbox change-domain 换域名（可同时申请真证书并套 Cloudflare），
 #     sbox change-argo 切换固定/临时隧道
 #   - 随机端口：新装时 5 个协议端口在 10000-60000 内随机分配（互不冲突，避开已占用），
-#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 6 可手动改
+#     多台服务器端口各不相同；重跑/升级保留已有端口，菜单 7 可手动改
 #   - 防火墙：自动从配置提取监听端口并在 firewalld/ufw/iptables 放行，
 #     配置增减协议或换端口时自动跟上
 #   - 证书：自动生成 www.bing.com 自签证书（供 Hy2/TUIC/AnyTLS/VMess-WS 使用）
@@ -51,7 +52,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.0.11"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.1.0"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 INPUT_TIMEOUT=60                # 输入类等待秒数：60 秒无输入自动按默认走下一步
 CHOICE_TIMEOUT=20               # 选择类等待秒数：20 秒无选择/回车一律取默认选择
 
@@ -66,6 +67,7 @@ UNIT="sing-box-auto"           # systemd 服务名：用专属名，避免覆盖
 ARGO_UNIT="${UNIT}-argo"       # Argo 隧道的 systemd 服务名（cloudflared 交 systemd 托管，崩溃自动拉起）
 ENV_FILE="$SB_DIR/auto.env"    # 持久化：UUID/端口/密钥，重跑时复用
 CF_ENV_FILE="$SB_DIR/cf.env"   # 持久化：Cloudflare API Token（仅换域名申请证书/套 CF 时用，600 权限）
+WARP_ENV_FILE="$SB_DIR/warp.env"   # 持久化：WARP 出站模式与 wgcf 一次性注册参数（菜单 change-warp 管理，600 权限）
 LINKS_FILE="/root/singbox-links.txt"
 
 # 端口分配：新装时随机（10000-60000），重跑/升级保留已有端口（见 load_or_gen_identity）
@@ -217,7 +219,8 @@ port_in_use() {
 rand_port() {
   # 在 10000-60000 内随机取一个空闲端口
   # 参数 $1：已分配端口列表（空格分隔，如 " 12345 23456 "），避免 5 个协议互相冲突
-  local allocated="$1" p tries=0
+  # 无参调用（如 warp_probe）时 $1 未绑定，set -u 下会直接炸，用 ${1:-} 容错
+  local allocated="${1:-}" p tries=0
   while (( tries < 100 )); do
     p=$(( (RANDOM * 32768 + RANDOM) % 50001 + 10000 ))
     if [[ "$allocated" != *" $p "* ]] && ! port_in_use "$p"; then
@@ -301,6 +304,9 @@ open_firewall() {
     fw_ok=1
   elif command -v iptables >/dev/null 2>&1 \
      && iptables -C INPUT -p tcp --dport "$first_port" -j ACCEPT 2>/dev/null; then
+    fw_ok=1
+  elif command -v ip6tables >/dev/null 2>&1 \
+     && ip6tables -C INPUT -p tcp --dport "$first_port" -j ACCEPT 2>/dev/null; then
     fw_ok=1
   fi
   if (( fw_ok == 1 )); then
@@ -386,7 +392,7 @@ fetch_latest_version() {
 download_singbox() {
   local ver="$1"
   local name="sing-box-${ver}-linux-${ARCH}"
-  curl -fSL --retry 2 -o "$SB_DIR/sing-box.tar.gz" \
+  curl -fSL --retry 2 --max-time 120 -o "$SB_DIR/sing-box.tar.gz" \
     "https://github.com/SagerNet/sing-box/releases/download/v${ver}/${name}.tar.gz" || return 1
   tar xzf "$SB_DIR/sing-box.tar.gz" -C "$SB_DIR" || return 1
   mv -f "$SB_DIR/$name/sing-box" "$SB_DIR/sing-box" || return 1
@@ -514,6 +520,14 @@ gen_certs() {
   if [[ -n "${TLS_DOMAIN:-}" && "$TLS_DOMAIN" != "$SNI_SELF" ]]; then
     _san="DNS:$SNI_SELF,DNS:$TLS_DOMAIN"
   fi
+  # 再带上本机公网 IP（IP SAN）：纯 IP 型机器（无域名）按 IP 直连时，
+  # 不允许 insecure 的客户端靠它完成 TLS 校验；拿不到的地址跳过该项
+  local _lip
+  for _lip in $(local_ip_set); do
+    if [[ "$_lip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$_lip" == *:* ]]; then
+      _san="$_san,IP:$_lip"
+    fi
+  done
   echo "[信息] 生成自签证书（CN=$SNI_SELF，SAN=$_san）…"
   openssl ecparam -genkey -name prime256v1 -out "$SB_DIR/private.key" 2>/dev/null
   # 必须带 SAN：现代 TLS 会拒绝只有 CN 的证书
@@ -651,21 +665,38 @@ cf_zone_ns_check() {
   return 1
 }
 
-# 列出 $2 上已有的 A/AAAA/CNAME 记录中「不指向本机 IP」的，输出摘要（空=无冲突）
-cf_domain_conflicts() {
-  local _zid="$1" _fqdn="$2" _ip="$3" _resp
-  _resp=$(cf_api GET "/zones/$_zid/dns_records?name=$_fqdn&per_page=100") || { printf ''; return 0; }
-  printf '%s' "$_resp" | jq -r --arg ip "$_ip" '[.result[] | select(.type=="A" or .type=="AAAA" or .type=="CNAME") | select(.content != $ip) | "\(.type)→\(.content)"] | join("；")' 2>/dev/null || true
+# 冲突判定谓词（jq 片段，cf_domain_conflicts 与 cf_delete_conflicting_records
+# 共用，改判定规则只改这一处，防两处分叉）：CNAME 独占域名、与 A/AAAA 不可
+# 共存，恒算冲突；A/AAAA 只与本机同族记录比（A 与 AAAA 可共存、互不妨碍），
+# 内容大小写归一后与本机地址不等的才算冲突。
+# 调用方须以 --arg ip（裸地址）与 --arg want（A 或 AAAA）传入
+cf_conflict_pred() {
+  printf '%s' '(.type=="CNAME") or (.type==$want and ((.content|ascii_downcase) != ($ip|ascii_downcase)))'
 }
 
-# 删除 $2 上与本机 IP 冲突的 A/AAAA/CNAME 记录（用户在冲突提示里确认覆盖后调用）
+# 列出 $2 上与本机冲突的记录摘要（空=无冲突）：同名 CNAME，或同族记录指向别处
+cf_domain_conflicts() {
+  local _zid="$1" _fqdn="$2" _ip="$3" _resp _want="A" _pred _jq
+  _ip="${_ip#[}"; _ip="${_ip%]}"   # 归一化：get_ip 的 v6 带方括号，记录 content 是裸地址
+  [[ "$_ip" == *:* ]] && _want="AAAA"
+  _resp=$(cf_api GET "/zones/$_zid/dns_records?name=$_fqdn&per_page=100") || { printf ''; return 0; }
+  _pred=$(cf_conflict_pred)
+  _jq='[.result[] | select('"$_pred"') | "\(.type)→\(.content)"] | join("；")'
+  printf '%s' "$_resp" | jq -r --arg ip "$_ip" --arg want "$_want" "$_jq" 2>/dev/null || true
+}
+
+# 删除 $2 上与本机冲突的记录（用户在冲突提示里确认覆盖后调用；判定与上共用谓词）
 cf_delete_conflicting_records() {
-  local _zid="$1" _fqdn="$2" _ip="$3" _resp _rid
+  local _zid="$1" _fqdn="$2" _ip="$3" _resp _rid _want="A" _pred _jq
+  _ip="${_ip#[}"; _ip="${_ip%]}"   # 归一化：同 cf_domain_conflicts
+  [[ "$_ip" == *:* ]] && _want="AAAA"
   _resp=$(cf_api GET "/zones/$_zid/dns_records?name=$_fqdn&per_page=100") || return 0
+  _pred=$(cf_conflict_pred)
+  _jq='.result[] | select('"$_pred"') | .id'
   while IFS= read -r _rid; do
     [[ -n "$_rid" ]] || continue
     cf_api DELETE "/zones/$_zid/dns_records/$_rid" >/dev/null 2>&1 || true
-  done < <(printf '%s' "$_resp" | jq -r --arg ip "$_ip" '.result[] | select(.type=="A" or .type=="AAAA" or .type=="CNAME") | select(.content != $ip) | .id' 2>/dev/null || true)
+  done < <(printf '%s' "$_resp" | jq -r --arg ip "$_ip" --arg want "$_want" "$_jq" 2>/dev/null || true)
 }
 
 # DNS-01 预检：在 _acme-challenge.$2 写一条随机 TXT，从公网 DNS 确认可见后删除；
@@ -736,26 +767,51 @@ cf_upsert_a_record() {
   printf '%s' "$_rid"
 }
 
+# 把 $2 的 AAAA 记录指向 $3（裸 IPv6，不带方括号）并开橙色云代理；输出 record_id
+# 与 cf_upsert_a_record 对称，纯 IPv6 机器走这条路径
+cf_upsert_aaaa_record() {
+  local _zid="$1" _fqdn="$2" _ip="$3" _resp _rid _body
+  _resp=$(cf_api GET "/zones/$_zid/dns_records?type=AAAA&name=$_fqdn") || return 1
+  _rid=$(printf '%s' "$_resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+  _body=$(printf '{"type":"AAAA","name":"%s","content":"%s","proxied":true,"ttl":1}' "$_fqdn" "$_ip")
+  if [[ -n "$_rid" ]]; then
+    cf_api PUT "/zones/$_zid/dns_records/$_rid" "$_body" >/dev/null || return 1
+  else
+    _resp=$(cf_api POST "/zones/$_zid/dns_records" "$_body") || return 1
+    _rid=$(printf '%s' "$_resp" | jq -r '.result.id // empty' 2>/dev/null || true)
+  fi
+  printf '%s' "$_rid"
+}
+
 # 给域名套上 Cloudflare：解析指向本机（橙色云）+ SSL 模式改完全（严格），
 # 并把 zone/record 记进 cf.env，供换域名/卸载时清理本脚本建的记录
 cf_setup_domain() {
-  local _fqdn="$1" _z _zid _ip _rid
+  local _fqdn="$1" _z _zid _ip _bare _rtype _rid
   _z=$(cf_zone_for_domain "$_fqdn") || { echo "[错误] 在 Cloudflare 找不到 $_fqdn 所属的已激活域名（确认域名已托管到该账号）"; return 1; }
   _zid="${_z%%$'\t'*}"
   _ip="$(get_ip)"
-  [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "[错误] 未取得公网 IPv4，无法设置解析"; return 1; }
-  _rid=$(cf_upsert_a_record "$_zid" "$_fqdn" "$_ip") || { echo "[错误] Cloudflare 解析记录写入失败"; return 1; }
+  _bare="${_ip#[}"; _bare="${_bare%]}"   # 归一化：裸地址（CF API 的 content 不接受方括号写法）
+  if [[ "$_bare" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    _rid=$(cf_upsert_a_record "$_zid" "$_fqdn" "$_bare") || { echo "[错误] Cloudflare 解析记录写入失败"; return 1; }
+    _rtype="A"
+  elif [[ "$_bare" == *:* ]]; then
+    _rid=$(cf_upsert_aaaa_record "$_zid" "$_fqdn" "$_bare") || { echo "[错误] Cloudflare 解析记录写入失败"; return 1; }
+    _rtype="AAAA"
+  else
+    echo "[错误] 未取得公网 IP（v4/v6 均无），无法设置解析"; return 1
+  fi
   cf_api PATCH "/zones/$_zid/settings/ssl" '{"value":"strict"}' >/dev/null 2>&1 \
     || echo "[警告] SSL 模式自动设置失败，请在 Cloudflare 手动改为「完全（严格）」"
   {
     printf 'CF_API_TOKEN="%s"\n' "$CF_API_TOKEN"
     printf 'CF_ZONE_ID="%s"\n' "$_zid"
     printf 'CF_RECORD_ID="%s"\n' "$_rid"
+    printf 'CF_RECORD_TYPE="%s"\n' "$_rtype"
     printf 'CF_HOST="%s"\n' "$_fqdn"
   } > "$CF_ENV_FILE"
   chmod 600 "$CF_ENV_FILE"
   TLS_ACME_MODE="cf"
-  echo "[信息] 已套 Cloudflare：$_fqdn → $_ip（橙色云代理），SSL 模式=完全（严格）"
+  echo "[信息] 已套 Cloudflare：$_fqdn → $_bare（$_rtype，橙色云代理），SSL 模式=完全（严格）"
 }
 
 # 删除本脚本在 Cloudflare 建的解析记录（换域名/卸载时调用；没有记录则静默跳过）
@@ -812,7 +868,8 @@ ensure_cf_auto_domain() {
 }
 
 # TLS 域名兜底：已设置则保留；未设置时优先用 Cloudflare 自动子域名（需已有
-# Token），否则用公网 IPv4 生成 sslip.io 临时域名（解析直达本机、立即可用）。
+# Token），否则用公网 IP 生成 sslip.io 临时域名（解析直达本机、立即可用；
+# IPv4 点换横杠、IPv6 冒号换横杠，两种写法均可解析出对应记录）。
 # 两种临时域名事后都可用 sbox change-domain 换成自己的真域名。
 ensure_tls_domain() {
   if [[ -n "${TLS_DOMAIN:-}" ]]; then
@@ -823,17 +880,23 @@ ensure_tls_domain() {
   if load_cf_token && ensure_cf_auto_domain; then
     return 0
   fi
-  local _ip
+  local _ip _bare
   _ip="$(get_ip)"
+  _bare="${_ip#[}"; _bare="${_bare%]}"   # 归一化：裸地址
   TLS_ACME=0
-  if [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    TLS_DOMAIN="${_ip//./-}.sslip.io"
+  if [[ "$_bare" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    TLS_DOMAIN="${_bare//./-}.sslip.io"
     TLS_DOMAIN_AUTO=1
     echo "[信息] TLS 域名自动生成（临时）：$TLS_DOMAIN"
+  elif [[ "$_bare" == *:* ]]; then
+    # sslip.io 的 IPv6 写法：冒号换横杠（:: 自然变成 --），可解析出 AAAA
+    TLS_DOMAIN="${_bare//:/-}.sslip.io"
+    TLS_DOMAIN_AUTO=1
+    echo "[信息] TLS 域名自动生成（临时，IPv6）：$TLS_DOMAIN"
   else
     TLS_DOMAIN="$SNI_SELF"
     TLS_DOMAIN_AUTO=1
-    echo "[警告] 未能获取公网 IPv4，TLS 域名暂用 $SNI_SELF（链接以 IP 直连），稍后可运行 sbox change-domain 更换"
+    echo "[警告] 未能获取公网 IP（v4/v6 均无），TLS 域名暂用 $SNI_SELF（链接以 IP 直连），稍后可运行 sbox change-domain 更换"
   fi
 }
 
@@ -1178,7 +1241,7 @@ prompt_install_choices() {
   # 1) TLS 域名：当前是脚本自动的临时域名时，给一次手填机会
   if [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]]; then
     local _d="" _tok_asked=0 _fails=0
-    echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
+    echo "[提示] 手填域名请先解析到本机 IP：$(get_ip | tr -d '[]')（IPv6 请建 AAAA 记录、IPv4 建 A 记录；填 Cloudflare Token 时脚本可自动设置解析）"
     while true; do
       if prompt_line_countdown "$INPUT_TIMEOUT" "TLS 域名（无输入自动用临时域名 ${TLS_DOMAIN}）: " /dev/tty; then
         _d=$(clean_domain "$REPLY_LINE")
@@ -1272,6 +1335,72 @@ EOF
 }
 
 #----------------------------- 7. 写 sing-box 配置 ---------------------------
+# 受限网络环境自适应（OpenVZ/venet 容器）：
+# 背景（2026-11-06 于 OpenVZ 免费机实测）：这类容器默认路由无网关、网卡是 venet，
+# sing-box 内置 DNS 要靠枚举网卡/路由选默认接口，而容器禁止枚举（日志原文
+# "list routes: address family not supported by protocol"），于是出站解析全灭、
+# 全部直连链与 ACME 一起死；同机的系统解析（/etc/resolv.conf）却一切正常。
+# 对策：三项指纹同时成立才判「受限」，write_config 给配置顶层加两段——
+# dns 走普通 UDP 指向系统解析（注意：sing-box 的 dns type "local" 仍走其自家
+# 拨号层、实测无效，必须普通 udp）；route 关闭接口自动探测并写死默认网卡。
+# 判假时不写这两段，生成的配置与改前逐字节一致（正常机器零影响）。
+# 检测宁可漏报不可误报：用到的命令缺失（systemd-detect-virt / ip）一律判假。
+
+# 默认路由的 dev 名（如 venet0 / eth0）；取不到输出空
+restricted_net_dev() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip route show default 2>/dev/null | head -n 1 \
+    | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+# 系统解析地址：/etc/resolv.conf 第一个 nameserver；读不到回退回环 stub 口
+restricted_net_nameserver() {
+  local _ns=""
+  if [[ -r /etc/resolv.conf ]]; then
+    _ns=$(awk '$1=="nameserver" {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+  fi
+  [[ -n "$_ns" ]] || _ns="127.0.0.53"
+  printf '%s\n' "$_ns"
+}
+
+# 三项指纹同时成立才返回 0：①OpenVZ ②默认路由 dev 以 venet 开头 ③默认路由无网关
+restricted_net_env() {
+  # ① OpenVZ：systemd-detect-virt 最直接；它缺失或判不出时退查
+  #    /proc/user_beancounters——OpenVZ/Virtuozzo 容器有此文件、普通机器没有
+  local _ovz=0
+  if command -v systemd-detect-virt >/dev/null 2>&1 \
+     && [[ "$(systemd-detect-virt 2>/dev/null || true)" == "openvz" ]]; then
+    _ovz=1
+  fi
+  if [[ -e /proc/user_beancounters ]]; then _ovz=1; fi
+  (( _ovz == 1 )) || return 1
+  command -v ip >/dev/null 2>&1 || return 1
+  # ② 网卡：默认路由 dev 名以 venet 开头（venet0 等）
+  local _dev
+  _dev=$(restricted_net_dev)
+  [[ "$_dev" == venet* ]] || return 1
+  # ③ 无网关：受限环境的默认路由形如 "default dev venet0 scope link"（无 via 段）；
+  #    IPv6 默认路由同机同形，可作旁证，这里以 IPv4 行为准即可（venet 机器必有此行）
+  local _def
+  _def=$(ip route show default 2>/dev/null | head -n 1)
+  [[ -n "$_def" && "$_def" != *" via "* ]] || return 1
+  return 0
+}
+
+# 受限时 write_config 追加的 JSON 尾段（顶层 dns + route）；非受限输出空。
+# $1 可选：调用方既有的 route 内字段（如 WARP 的 rules/final），非空时并入
+# 同一个 route 对象，避免顶层出现两个 "route" 键；default_interface 取不到时
+# 只写 auto_detect_interface。
+restricted_net_tail() {
+  restricted_net_env || return 0
+  local _ns _dev _route="\"auto_detect_interface\": false"
+  _ns=$(restricted_net_nameserver)
+  _dev=$(restricted_net_dev)
+  if [[ -n "$_dev" ]]; then _route="$_route, \"default_interface\": \"$_dev\""; fi
+  if [[ -n "${1:-}" ]]; then _route="$_route, $1"; fi
+  printf ',\n  "dns": {"servers": [{"type": "udp", "server": "%s", "tag": "sys"}], "final": "sys"},\n  "route": {%s}' "$_ns" "$_route"
+}
+
 write_config() {
   echo "[信息] 写入 sing-box 配置…"
   # 域名 TLS 入站的 tls 段两种形态：默认自签证书；换真域名并提供 CF Token 后走
@@ -1296,6 +1425,36 @@ write_config() {
     fi
   else
     vtls_tls="$_self_tls"
+  fi
+  # WARP 出站：状态在 warp.env（菜单 change-warp 管理）；关闭或注册参数不全时
+  # 不生成任何 WARP 配置（零成本），换端口/UUID/域名等重写配置时原样保留
+  load_warp_env
+  local _warp_tail="" _ep_tail="" _warp_route=""
+  if [[ "$WARP_MODE" != "off" ]]; then
+    if warp_profile_complete; then
+      local _ep
+      _ep=$(warp_endpoint_json)
+      _ep_tail=",
+  \"endpoints\": [$_ep]"
+      if [[ "$WARP_MODE" == "all" ]]; then
+        _warp_route="\"final\": \"warp\""
+      else
+        _warp_route="\"rules\": [{\"ip_cidr\": [\"0.0.0.0/0\"], \"outbound\": \"warp\"}], \"final\": \"direct\""
+      fi
+    else
+      echo "[警告] WARP 模式为 $WARP_MODE 但注册参数不齐全，本次配置不启用 WARP（运行 sbox change-warp 重新注册）"
+    fi
+  fi
+  # 尾段组装：受限网络自适应（restricted_net_tail）判假时返回空；判真时其 route
+  # 对象需与 WARP 的 route 字段合并（把 _warp_route 作为 $1 传入并入同一对象）。
+  # 非受限时走原路径：endpoints + route 逐字拼接，产物与改前逐字节一致。
+  local _net_tail
+  _net_tail=$(restricted_net_tail "$_warp_route")
+  if [[ -n "$_warp_route" && -z "$_net_tail" ]]; then
+    _warp_tail="$_ep_tail,
+  \"route\": {$_warp_route}"
+  else
+    _warp_tail="$_ep_tail$_net_tail"
   fi
   cat > "$SB_DIR/sb.json" <<EOF
 {
@@ -1369,7 +1528,7 @@ write_config() {
       "tls": { $vtls_tls }
     }
   ],
-  "outbounds": [{"type": "direct", "tag": "direct"}]
+  "outbounds": [{"type": "direct", "tag": "direct"}]${_warp_tail}
 }
 EOF
   chmod 600 "$SB_DIR/sb.json"   # 内含 Reality 私钥与（ACME 模式下）CF Token，按密钥文件对待
@@ -1545,7 +1704,7 @@ ensure_cloudflared() {
       armv7l) cf_arch="arm" ;;
       *) cf_arch="${ARCH:-amd64}" ;;
     esac
-    if ! curl -fSL --retry 2 -o "$cf" \
+    if ! curl -fSL --retry 2 --max-time 120 -o "$cf" \
       "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
       echo "[警告] cloudflared 下载失败" >&2
       return 1
@@ -1626,8 +1785,9 @@ get_ip() {
 b64() { base64 -w 0 2>/dev/null || base64 | tr -d '\n'; }
 
 print_links() {
-  local ip host
+  local ip host ip_bare
   ip="$(get_ip)"
+  ip_bare="${ip#[}"; ip_bare="${ip_bare%]}"   # 裸地址：仅 VMess 的 add 字段用（base64-JSON 不是 URI，不带方括号）
   host="$(hostname)"
 
   local vl_link vm_link hy2_link tuic_link an_link vt_link
@@ -1637,7 +1797,7 @@ print_links() {
   vl_link="vless://${UUID}@${ip}:${PORT_VLESS}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI_REALITY}&fp=chrome&pbk=${PUBKEY}&sid=${SHORTID}&type=tcp&headerType=none#vl-reality-${host}"
 
   vm_link="vmess://$(printf '{"add":"%s","aid":"0","host":"%s","id":"%s","net":"ws","path":"%s-vm","port":"%s","ps":"vm-ws-%s","tls":"","type":"none","v":"2"}' \
-    "$ip" "$SNI_SELF" "$UUID" "$UUID" "$PORT_VMESS" "$host" | b64)"
+    "$ip_bare" "$SNI_SELF" "$UUID" "$UUID" "$PORT_VMESS" "$host" | b64)"
 
   hy2_link="hysteria2://${UUID}@${ip}:${PORT_HY2}?security=tls&alpn=h3&insecure=1&allowInsecure=1&sni=${SNI_SELF}#hy2-${host}"
 
@@ -1859,7 +2019,7 @@ do_change_domain() {
   local _auto_desc="手动设置"
   [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]] && _auto_desc="自动生成的临时域名"
   echo "当前 TLS 域名：${TLS_DOMAIN:-（未设置）}（$_auto_desc，证书：$_cert_desc，端口：${PORT_VTLS:-}）"
-  echo "[提示] 手填域名请先解析到本机 IP：$(get_ip)（填 Cloudflare Token 时脚本可自动设置解析）"
+  echo "[提示] 手填域名请先解析到本机 IP：$(get_ip | tr -d '[]')（IPv6 请建 AAAA 记录、IPv4 建 A 记录；填 Cloudflare Token 时脚本可自动设置解析）"
   local _d="" _tok_asked=0 _fails=0 _use_default=0 _direct_acme=0
   while true; do
     # 60 秒无输入（含直接回车）= 按默认：重新自动生成临时域名，不再追问
@@ -1978,6 +2138,45 @@ start_argo_fixed() {
   echo "[信息] 固定隧道域名：${ARGO_DOMAIN:-（未知）}"
 }
 
+# Argo 期望状态对齐检查：argo.env 声明的模式/令牌（或临时隧道的 VMess 端口）
+# 与现行 Argo 单元 ExecStart（无 systemd 时为 crontab @reboot 行）不一致、
+# 或单元/自启行缺失时返回 0（需要重建），一致返回 1。此前 restart 根本不碰
+# Argo，外部手改 argo.env 后跑多少次 restart 都不会生效，靠它在重启时发现。
+argo_unit_diverged() {
+  local _want _cur=""
+  if [[ -f "$SB_DIR/argo.env" ]] && grep -q '^ARGO_MODE="fixed"' "$SB_DIR/argo.env"; then
+    local _tok
+    _tok=$(grep '^ARGO_TOKEN=' "$SB_DIR/argo.env" 2>/dev/null | cut -d'"' -f2 || true)
+    _want="tunnel --no-autoupdate run --token $_tok"
+  else
+    _want="tunnel --url http://localhost:${PORT_VMESS}"
+  fi
+  if [[ -f "/etc/systemd/system/${ARGO_UNIT}.service" ]]; then
+    _cur=$(grep '^ExecStart=' "/etc/systemd/system/${ARGO_UNIT}.service" 2>/dev/null | sed 's/^ExecStart=//' || true)
+  elif command -v crontab >/dev/null 2>&1; then
+    _cur=$(crontab -l 2>/dev/null | grep '@reboot' | grep "$SB_DIR/cloudflared" || true)
+  fi
+  [[ -n "$_cur" && "$_cur" == *"$_want"* ]] && return 1
+  return 0
+}
+
+# 重启（菜单项 2 与 restart 动作共用）：本体重启后对齐 Argo 期望状态。
+# 配置无分歧时不扰动在跑的隧道——临时隧道一旦重连就会换域名、已分享的
+# 链接随之作废；仅当隧道没在运行时才按现行配置把它拉起来。
+do_restart() {
+  load_env_or_exit
+  setup_service
+  if argo_unit_diverged; then
+    echo "[信息] 检测到 Argo 配置与运行状态不一致，按 argo.env 重新生成"
+    start_argo
+  elif [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
+    systemctl is-active --quiet "$ARGO_UNIT" 2>/dev/null || start_argo
+  else
+    pgrep -f "$SB_DIR/cloudflared.*tunnel" >/dev/null 2>&1 || start_argo
+  fi
+  echo "[完成] 服务已重启"
+}
+
 # 7. Argo 隧道管理子菜单
 do_argo_menu() {
   load_env_or_exit
@@ -1996,20 +2195,30 @@ do_argo_menu() {
     else
       echo "当前模式：临时隧道（${ARGO_DOMAIN:-未建立}）"
     fi
-    echo "1. 重启临时隧道（获取新域名）"
-    echo "2. 设置固定隧道（需 Cloudflare Token）"
-    echo "3. 切换回临时隧道"
-    echo "4. 重新抓取隧道域名（隧道在跑但没显示域名时用）"
+    echo "1. 重新抓取隧道域名（隧道在跑但没显示域名时用）"
+    echo "2. 重启临时隧道（获取新域名）"
+    echo "3. 设置固定隧道（需 Cloudflare Token）"
+    echo "4. 切换回临时隧道"
     echo "0. 返回上级"
     read -rp "请选择 [0-4]: " c
     case "$c" in
       1)
+        ARGO_DOMAIN="$(current_argo_domain)"
+        if [[ -n "$ARGO_DOMAIN" ]]; then
+          echo "[信息] 抓到域名：$ARGO_DOMAIN"
+          print_links
+        else
+          echo "[警告] 日志里还没有域名，隧道可能仍在启动中，稍后再试"
+          tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
+        fi
+        ;;
+      2)
         rm -f "$SB_DIR/argo.env"
         unset ARGO_MODE ARGO_TOKEN ARGO_DOMAIN
         start_argo
         print_links
         ;;
-      2)
+      3)
         local token domain
         read -rp "输入 Argo Tunnel Token: " token
         read -rp "输入固定隧道域名: " domain
@@ -2040,22 +2249,446 @@ EOF
         echo
         echo "[完成] 已切换到固定隧道：$domain"
         ;;
-      3)
+      4)
         rm -f "$SB_DIR/argo.env"
         unset ARGO_MODE ARGO_TOKEN ARGO_DOMAIN
         start_argo
         print_links
         ;;
-      4)
-        ARGO_DOMAIN="$(current_argo_domain)"
-        if [[ -n "$ARGO_DOMAIN" ]]; then
-          echo "[信息] 抓到域名：$ARGO_DOMAIN"
-          print_links
-        else
-          echo "[警告] 日志里还没有域名，隧道可能仍在启动中，稍后再试"
-          tail -n 5 "$SB_DIR/argo.log" 2>/dev/null || true
-        fi
-        ;;
+      0) break ;;
+      *) echo "[错误] 无效选择" ;;
+    esac
+  done
+}
+
+#----------------------------- WARP 出站 -------------------------------------
+# sing-box 内置 WireGuard 出口：不开 TUN、不加常驻进程，关闭时配置里不生成
+# 任何 WARP 内容（零成本）。注册参数由 wgcf 一次性生成（下载→注册→删除，
+# 绝不常驻），全部落在 warp.env（600 权限，只用 grep 解析、从不 source），
+# 之后可经菜单 change-warp 开关、切换模式或重新注册。
+# 模式：off=关闭；ipv4=仅 IPv4 目的地经 WARP（给纯 IPv6 机器补 IPv4 出口，
+# 其余直连）；all=全部流量经 WARP。
+
+# 读取 warp.env 到全局变量；文件不存在或字段被污染时按关闭处理
+load_warp_env() {
+  WARP_MODE="off"; WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""
+  WARP_RESERVED=""; WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""
+  WARP_MTU=""
+  [[ -f "$WARP_ENV_FILE" ]] || return 0
+  local _v
+  _v=$(grep '^WARP_MODE=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  case "$_v" in off|ipv4|all) WARP_MODE="$_v" ;; esac
+  WARP_PRIVATE_KEY=$(grep '^WARP_PRIVATE_KEY=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_V4=$(grep '^WARP_V4=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_V6=$(grep '^WARP_V6=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_RESERVED=$(grep '^WARP_RESERVED=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_PEER_KEY=$(grep '^WARP_PEER_KEY=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_ENDPOINT_HOST=$(grep '^WARP_ENDPOINT_HOST=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_ENDPOINT_PORT=$(grep '^WARP_ENDPOINT_PORT=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  WARP_MTU=$(grep '^WARP_MTU=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  # 字符集校验：私钥字段异常说明状态文件被污染，整份状态视为不可用，
+  # 宁可日后重新注册，也不拿坏参数生成配置
+  if [[ -n "$WARP_PRIVATE_KEY" && ! "$WARP_PRIVATE_KEY" =~ ^[A-Za-z0-9+/]{42,44}={0,2}$ ]]; then
+    echo "[警告] warp.env 中的 WARP 私钥格式异常，已忽略现有 WARP 状态" >&2
+    WARP_MODE="off"; WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""; WARP_RESERVED=""
+    WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""; WARP_MTU=""
+  fi
+  return 0
+}
+
+# 注册参数是否齐全（生成 endpoint 配置的最低要求）
+warp_profile_complete() {
+  [[ -n "$WARP_PRIVATE_KEY" && -n "$WARP_V4" && -n "$WARP_PEER_KEY" \
+     && -n "$WARP_ENDPOINT_HOST" && -n "$WARP_ENDPOINT_PORT" ]]
+}
+
+# 原子落盘：先写临时文件再改名，避免中途断电/中断留下半份 warp.env
+save_warp_env() {
+  local _tmp="$WARP_ENV_FILE.tmp"
+  {
+    printf 'WARP_MODE="%s"\n' "${WARP_MODE:-off}"
+    printf 'WARP_PRIVATE_KEY="%s"\n' "$WARP_PRIVATE_KEY"
+    printf 'WARP_V4="%s"\n' "$WARP_V4"
+    printf 'WARP_V6="%s"\n' "$WARP_V6"
+    printf 'WARP_RESERVED="%s"\n' "$WARP_RESERVED"
+    printf 'WARP_PEER_KEY="%s"\n' "$WARP_PEER_KEY"
+    printf 'WARP_ENDPOINT_HOST="%s"\n' "$WARP_ENDPOINT_HOST"
+    printf 'WARP_ENDPOINT_PORT="%s"\n' "$WARP_ENDPOINT_PORT"
+    printf 'WARP_MTU="%s"\n' "$WARP_MTU"
+  } > "$_tmp" && mv -f "$_tmp" "$WARP_ENV_FILE"
+  chmod 600 "$WARP_ENV_FILE"
+}
+
+warp_mode_desc() {
+  case "${WARP_MODE:-off}" in
+    ipv4) echo "IPv4 经 WARP（其余直连）" ;;
+    all) echo "全部流量经 WARP" ;;
+    *) echo "关闭" ;;
+  esac
+}
+
+# 生成 sing-box 的 WireGuard endpoint JSON（调用前须 load_warp_env 且参数齐全）
+warp_endpoint_json() {
+  local _addr="\"$WARP_V4/32\""
+  [[ -n "$WARP_V6" ]] && _addr="$_addr, \"$WARP_V6/128\""
+  local _res=""
+  [[ -n "$WARP_RESERVED" ]] && _res=", \"reserved\": [${WARP_RESERVED//,/, }]"
+  printf '%s' "{\"type\": \"wireguard\", \"tag\": \"warp\", \"address\": [$_addr], \"private_key\": \"$WARP_PRIVATE_KEY\", \"mtu\": ${WARP_MTU:-1280}, \"peers\": [{\"address\": \"$WARP_ENDPOINT_HOST\", \"port\": $WARP_ENDPOINT_PORT, \"public_key\": \"$WARP_PEER_KEY\", \"allowed_ips\": [\"0.0.0.0/0\", \"::/0\"]$_res}]}"
+}
+
+# 下载 wgcf 到 $1：先走 ensure_github 的可达性引导（纯 IPv6 机经 DNS64/NAT64
+# 绕行 GitHub），再按 GitHub API 找最新版的本架构资产
+warp_fetch_wgcf() {
+  local _dst="$1" _arch _resp _url
+  case "$(uname -m)" in
+    x86_64) _arch="amd64" ;;
+    aarch64) _arch="arm64" ;;
+    armv7l) _arch="armv7" ;;
+    armv6l) _arch="armv6" ;;
+    i386|i686) _arch="386" ;;
+    *) echo "[错误] 当前架构 $(uname -m) 没有 wgcf 官方构建" >&2; return 1 ;;
+  esac
+  ensure_github || true
+  _resp=$(curl -fsSL --max-time 20 --retry 2 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null || true)
+  _url=$(printf '%s' "$_resp" | grep -o "\"browser_download_url\": *\"[^\"]*_linux_${_arch}\"" | head -n 1 | cut -d'"' -f4 || true)
+  [[ -n "$_url" ]] || { echo "[错误] 未能获取 wgcf 下载地址（GitHub 不可达或无此架构资产）" >&2; return 1; }
+  curl -fSL --retry 2 --max-time 120 -o "$_dst" "$_url" 2>/dev/null || { echo "[错误] wgcf 下载失败" >&2; return 1; }
+  chmod +x "$_dst"
+}
+
+# 用 wgcf 一次性注册并把参数解析进全局变量（不落盘，由调用方决定何时保存）。
+# wgcf 只在临时目录里存在，结束即删；注册有界重试 3 次、单次 60 秒超时。
+warp_register() {
+  echo "[信息] 正在用 wgcf 一次性注册 WARP 设备（用完即删，不常驻）…"
+  local _dir _try _ok=0
+  _dir=$(mktemp -d)
+  if ! warp_fetch_wgcf "$_dir/wgcf"; then
+    rm -rf "$_dir"
+    return 1
+  fi
+  for _try in 1 2 3; do
+    if ( cd "$_dir" && timeout 60 ./wgcf register --accept-tos >/dev/null 2>&1 \
+         && timeout 60 ./wgcf generate >/dev/null 2>&1 ) \
+       && [[ -f "$_dir/wgcf-profile.conf" ]]; then
+      _ok=1; break
+    fi
+    echo "[警告] WARP 注册第 ${_try} 次尝试失败（共 3 次）"
+    [[ "$_try" -lt 3 ]] && sleep $((_try * 3))
+  done
+  if [[ "$_ok" != "1" ]]; then
+    echo "[错误] WARP 注册失败：wgcf 三次尝试均未完成（多为 Cloudflare 注册接口不可达）"
+    rm -rf "$_dir"
+    return 1
+  fi
+  # 解析 wgcf-profile.conf：[Interface] PrivateKey/Address/MTU、[Peer] PublicKey/Endpoint
+  local _conf="$_dir/wgcf-profile.conf" _addr _ep _cid _hex
+  WARP_PRIVATE_KEY=$(grep -E '^PrivateKey[[:space:]]*=' "$_conf" | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _addr=$(grep -E '^Address[[:space:]]*=' "$_conf" | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  WARP_V4=$(printf '%s' "$_addr" | tr ',' '\n' | grep -E '^[0-9.]+/' | head -n 1 | cut -d/ -f1 || true)
+  WARP_V6=$(printf '%s' "$_addr" | tr ',' '\n' | grep ':' | head -n 1 | cut -d/ -f1 || true)
+  WARP_PEER_KEY=$(grep -E '^PublicKey[[:space:]]*=' "$_conf" | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  WARP_MTU=$(grep -E '^MTU[[:space:]]*=' "$_conf" | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _ep=$(grep -E '^Endpoint[[:space:]]*=' "$_conf" | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  WARP_ENDPOINT_HOST="${_ep%:*}"
+  WARP_ENDPOINT_PORT="${_ep##*:}"
+  # reserved（client_id 三字节）：wgcf 的输出文件里带 client_id 就解出来存下；
+  # 没有就留空（endpoint 不写 reserved 字段），是否可用以启用后出口实测为准
+  WARP_RESERVED=""
+  _cid=$(grep -hoE 'client_id"?[[:space:]]*[:=][[:space:]]*"?[A-Za-z0-9+/=]+' \
+           "$_dir/wgcf-account.toml" "$_conf" 2>/dev/null | grep -oE '[A-Za-z0-9+/=]+$' | head -n 1 || true)
+  if [[ -n "$_cid" ]]; then
+    _hex=$(printf '%s' "$_cid" | base64 -d 2>/dev/null | od -An -tu1 | tr -s ' ' || true)
+    WARP_RESERVED=$(printf '%s' "$_hex" | awk '{if (NF>=3) printf "%s,%s,%s", $1, $2, $3}')
+  fi
+  rm -rf "$_dir"
+  [[ -n "$WARP_MTU" ]] || WARP_MTU="1280"
+  if ! warp_profile_complete; then
+    echo "[错误] WARP 注册结果不完整（wgcf 输出缺少必要参数）"
+    return 1
+  fi
+  echo "[信息] WARP 注册完成"
+  return 0
+}
+
+# 生成探针配置到 $1/probe.json（本地入口端口 $2）：仅本地 mixed 入口 + WARP
+# 出口、route final=warp。探针进程与主配置同病同治：受限网络环境下探针的
+# 内置解析同样枚举不到默认接口（www.cloudflare.com 还没轮到走 WARP 就先死
+# 在解析上），故探针配置并入同一份自适应 dns/route（route 的 final 仍为
+# warp）；非受限环境保持原字面量，行为与此前一致。
+# warp_probe（出口自检）与 warp_trace_info（出口信息展示）共用此生成方式
+warp_write_probe_config() {
+  local _dir="$1" _port="$2" _probe_tail
+  if restricted_net_env; then
+    _probe_tail=$(restricted_net_tail '"final": "warp"')
+  else
+    _probe_tail=',
+  "route": {"final": "warp"}'
+  fi
+  cat > "$_dir/probe.json" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [{"type": "mixed", "tag": "probe-in", "listen": "127.0.0.1", "listen_port": $_port}],
+  "endpoints": [$(warp_endpoint_json)],
+  "outbounds": [{"type": "direct", "tag": "direct"}]${_probe_tail}
+}
+EOF
+}
+
+# 出口自检：用与正式配置相同的 WARP 参数起一个临时 sing-box（仅本地 mixed
+# 入口 + WARP 出口），经它取 Cloudflare trace，确认 warp=on/plus 才算通。
+# 临时进程与文件用完即删，不碰正在运行的服务。成功返回 0
+warp_probe() {
+  local _dir _port _pid _out _try
+  _dir=$(mktemp -d)
+  _port=$(rand_port)
+  warp_write_probe_config "$_dir" "$_port"
+  if ! "$SB_DIR/sing-box" check -c "$_dir/probe.json" >/dev/null 2>&1; then
+    echo "[错误] WARP 自检配置未通过 sing-box 校验"
+    rm -rf "$_dir"
+    return 1
+  fi
+  "$SB_DIR/sing-box" run -c "$_dir/probe.json" > "$_dir/probe.log" 2>&1 &
+  _pid=$!
+  _out=""
+  for _try in 1 2 3 4 5; do
+    sleep 3
+    _out=$(curl -s --max-time 10 -x "socks5h://127.0.0.1:$_port" \
+             "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null \
+           | grep -E '^warp=' | cut -d= -f2 || true)
+    [[ "$_out" == "on" || "$_out" == "plus" ]] && break
+    _out=""
+  done
+  kill "$_pid" >/dev/null 2>&1 || true
+  wait "$_pid" 2>/dev/null || true
+  if [[ -n "$_out" ]]; then
+    echo "[信息] WARP 出口自检通过（Cloudflare trace 显示 warp=$_out）"
+    rm -rf "$_dir"
+    return 0
+  fi
+  echo "[错误] WARP 出口自检未通过：经 WARP 访问 Cloudflare trace 未得到 warp=on，自检日志最后几行："
+  tail -n 5 "$_dir/probe.log" 2>/dev/null || true
+  rm -rf "$_dir"
+  return 1
+}
+
+# 解析 Cloudflare trace 全文（$1）：仅 warp=on/plus 时提取 ip= 与 loc=，
+# 成功输出一行「WARP 出口：<ip>（<loc>）」（缺 loc 时只输出 IP），
+# 否则返回 1 且无输出。
+# 【铁律】trace 里的出口 IP 是 Cloudflare 的共享出口地址，只许展示给人看，
+# 绝不写入任何节点链接、env 或配置当服务器地址用——ygkkk 旧脚本曾把经
+# WARP 探测到的出口 IP 写进直链与域名校验，造成链接拨不通、解析对不上；
+# 本项目结构上禁止重蹈：本函数与 warp_trace_info 的输出无任何落盘路径
+warp_trace_parse() {
+  local _txt="$1" _w _ip _loc
+  _w=$(printf '%s\n' "$_txt" | grep -E '^warp=' | head -n 1 | cut -d= -f2 || true)
+  [[ "$_w" == "on" || "$_w" == "plus" ]] || return 1
+  _ip=$(printf '%s\n' "$_txt" | grep -E '^ip=' | head -n 1 | cut -d= -f2 || true)
+  [[ -n "$_ip" ]] || return 1
+  _loc=$(printf '%s\n' "$_txt" | grep -E '^loc=' | head -n 1 | cut -d= -f2 || true)
+  if [[ -n "$_loc" ]]; then
+    printf 'WARP 出口：%s（%s）\n' "$_ip" "$_loc"
+  else
+    printf 'WARP 出口：%s\n' "$_ip"
+  fi
+}
+
+# 展示当前 WARP 出口 IP 与落地国家：WARP 未启用（模式 off 或参数不齐）时
+# 直接返回 1、不输出、也不起探针；启用时起一个临时 sing-box 经 WARP 拉
+# trace 再解析（探针配置与 warp_probe 共用 warp_write_probe_config，临时
+# 进程与目录用完即清理，同 warp_probe 规矩）。取不到就返回 1 不输出，
+# 调用方一律以 || true 承接，绝不阻塞菜单与安装流程
+warp_trace_info() {
+  load_warp_env
+  [[ "$WARP_MODE" != "off" ]] || return 1
+  warp_profile_complete || return 1
+  local _dir _port _pid _txt="" _try
+  _dir=$(mktemp -d)
+  _port=$(rand_port)
+  warp_write_probe_config "$_dir" "$_port"
+  if ! "$SB_DIR/sing-box" check -c "$_dir/probe.json" >/dev/null 2>&1; then
+    rm -rf "$_dir"
+    return 1
+  fi
+  "$SB_DIR/sing-box" run -c "$_dir/probe.json" > "$_dir/probe.log" 2>&1 &
+  _pid=$!
+  for _try in 1 2 3 4 5; do
+    sleep 3
+    _txt=$(curl -s --max-time 10 -x "socks5h://127.0.0.1:$_port" \
+             "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    if printf '%s' "$_txt" | grep -qE '^warp='; then break; fi
+    _txt=""
+  done
+  kill "$_pid" >/dev/null 2>&1 || true
+  wait "$_pid" 2>/dev/null || true
+  rm -rf "$_dir"
+  [[ -n "$_txt" ]] || return 1
+  warp_trace_parse "$_txt"
+}
+
+# 回滚 WARP 变更：恢复 auto.env / sb.json / warp.env 三件套备份并重启服务
+# （备份不存在的 warp.env 按「原本没有」处理：回滚时删除）
+warp_rollback() {
+  [[ -f "$ENV_FILE.bak" ]] && cp -f "$ENV_FILE.bak" "$ENV_FILE" || true
+  [[ -f "$SB_DIR/sb.json.bak" ]] && cp -f "$SB_DIR/sb.json.bak" "$SB_DIR/sb.json" || true
+  if [[ -f "$WARP_ENV_FILE.bak" ]]; then
+    cp -f "$WARP_ENV_FILE.bak" "$WARP_ENV_FILE"
+  else
+    rm -f "$WARP_ENV_FILE"
+  fi
+  rm -f "$ENV_FILE.bak" "$SB_DIR/sb.json.bak" "$WARP_ENV_FILE.bak"
+  # shellcheck disable=SC1090
+  . "$ENV_FILE" 2>/dev/null || true
+  setup_service
+}
+
+# 切换 WARP 模式（原子生效，与换端口同规矩）：先备份、需要时才注册（已有
+# 参数直接复用，幂等）、落盘新状态、生成配置（子进程跑 write_config，挡住
+# 它校验失败时的 exit）、重启、出口自检；任一步失败自动回滚并说明原因。
+# $1=目标模式 off|ipv4|all  $2=1 时强制重新注册（换一套设备参数）
+warp_apply() {
+  local _mode="$1" _force="${2:-0}"
+  load_env_or_exit
+  load_warp_env
+  cp -f "$ENV_FILE" "$ENV_FILE.bak" 2>/dev/null || true
+  [[ -f "$SB_DIR/sb.json" ]] && cp -f "$SB_DIR/sb.json" "$SB_DIR/sb.json.bak" || true
+  [[ -f "$WARP_ENV_FILE" ]] && cp -f "$WARP_ENV_FILE" "$WARP_ENV_FILE.bak" || true
+  if [[ "$_mode" != "off" || "$_force" == "1" ]]; then
+    if [[ "$_force" == "1" ]]; then
+      WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""; WARP_RESERVED=""
+      WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""; WARP_MTU=""
+    fi
+    if ! warp_profile_complete; then
+      if ! warp_register; then
+        echo "[错误] WARP 注册未完成，未做任何修改"
+        rm -f "$ENV_FILE.bak" "$SB_DIR/sb.json.bak" "$WARP_ENV_FILE.bak"
+        return 1
+      fi
+    fi
+  fi
+  WARP_MODE="$_mode"
+  save_warp_env
+  if ! ( write_config ); then
+    echo "[错误] 新配置生成/校验失败，已自动回滚，WARP 模式未改变"
+    warp_rollback
+    return 1
+  fi
+  setup_service
+  if [[ "$_mode" != "off" ]] && ! warp_probe; then
+    echo "[错误] WARP 已写入配置但出口自检未通过，已自动回滚到之前的状态"
+    warp_rollback
+    return 1
+  fi
+  rm -f "$ENV_FILE.bak" "$SB_DIR/sb.json.bak" "$WARP_ENV_FILE.bak"
+  echo "[完成] WARP 出站模式已更新：$(warp_mode_desc)"
+  # 启用成功顺手展示一次出口 IP 与落地国家（仅展示，取不到不算失败）
+  if [[ "$_mode" != "off" ]]; then
+    warp_trace_info || true
+  fi
+  return 0
+}
+
+# 本机是否有可用的 IPv4 出口（与 ensure_github 的 IPv6 检测同一探法）
+has_ipv4_egress() {
+  curl -4 -fsS --connect-timeout 5 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace >/dev/null 2>&1
+}
+
+# 安装时的 WARP 决策（静默安装哲学）：已有状态直接保留、不重复决策；
+# 否则按环境定默认——无 IPv4 出口默认开启 IPv4 经 WARP、有 IPv4 出口默认
+# 关闭；有终端时给一次 20 秒选择（回车/输错/超时取默认），无终端直接用默认。
+# 注册/自检失败一律降级为关闭并留一句总结（WARP_NOTE），绝不中断安装、
+# 不留半成品（失败时不保存注册参数，日后可从菜单重新注册）。
+warp_install_setup() {
+  load_warp_env
+  if [[ "$WARP_MODE" != "off" ]] || warp_profile_complete; then
+    return 0
+  fi
+  local _def="off" _def_desc="关闭"
+  if ! has_ipv4_egress; then
+    _def="ipv4"; _def_desc="开启（IPv4 经 WARP）"
+  fi
+  local _choice="$_def" _ans=""
+  if [[ -r /dev/tty ]]; then
+    read -t "$CHOICE_TIMEOUT" -r -p "WARP 出站：1=开启（IPv4 经 WARP） 2=全部经 WARP 3=关闭（回车/输错/20 秒无输入 = 默认选择：$_def_desc）: " _ans </dev/tty || _ans=""
+    case "$_ans" in
+      1) _choice="ipv4" ;;
+      2) _choice="all" ;;
+      3) _choice="off" ;;
+      *) _choice="$_def" ;;
+    esac
+  fi
+  if [[ "$_choice" == "off" ]]; then
+    WARP_NOTE="WARP 出站：未开启（可日后运行 sbox change-warp 开启）"
+    echo "[信息] $WARP_NOTE"
+    return 0
+  fi
+  if warp_register && warp_probe; then
+    WARP_MODE="$_choice"
+    save_warp_env
+    WARP_NOTE="WARP 出站：已开启（$(warp_mode_desc)）"
+    # 总结里带上出口 IP 与落地国家（仅展示，取不到就跳过、不算失败）
+    local _ti=""
+    _ti=$(warp_trace_info || true)
+    [[ -n "$_ti" ]] && WARP_NOTE="$WARP_NOTE；$_ti"
+    echo "[信息] $WARP_NOTE"
+  else
+    WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""; WARP_RESERVED=""
+    WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""; WARP_MTU=""
+    WARP_MODE="off"
+    rm -f "$WARP_ENV_FILE"
+    WARP_NOTE="WARP 出站：未开启（注册或出口自检未通过，已自动跳过；可日后运行 sbox change-warp 重试）"
+    echo "[警告] $WARP_NOTE"
+  fi
+  return 0
+}
+
+# 更换 WARP IP：强制重新注册一套设备参数（出口 IP 随新账号变更），保持当前
+# 模式不变。一次调用只换一次——频繁注册会招 Cloudflare 注册限流（429），
+# 想再换请隔段时间。底层走 warp_apply 的强制注册路径：先备份、生成新配置、
+# 重启、出口自检，任一步失败自动回滚到旧参数与旧配置（原出口 IP 保住）；
+# 普通 change-warp 的「参数齐全直接复用」幂等路径不经过这里、不受影响
+warp_reroll() {
+  load_warp_env
+  if [[ "$WARP_MODE" == "off" ]]; then
+    echo "[提示] WARP 当前为关闭状态，没有可更换的出口 IP；请先在菜单选 1 或 2 启用 WARP"
+    return 0
+  fi
+  echo "[信息] 正在更换 WARP IP（重新注册一套设备参数，模式保持：$(warp_mode_desc)）…"
+  if warp_apply "$WARP_MODE" 1; then
+    return 0
+  fi
+  echo "[提示] 更换 WARP IP 未成功，已恢复原有参数与配置（原出口 IP 保持不变）"
+  return 0
+}
+
+# WARP 出站管理子菜单
+do_warp_menu() {
+  load_env_or_exit
+  while true; do
+    load_warp_env
+    echo
+    echo "---------- WARP 出站管理 ----------"
+    echo "当前模式：$(warp_mode_desc)"
+    if warp_profile_complete; then
+      echo "注册状态：已注册（参数在 $WARP_ENV_FILE，重复开启直接复用、不重新注册）"
+    else
+      echo "注册状态：未注册（首次开启时用 wgcf 一次性注册，用完即删）"
+    fi
+    # 已启用时在状态区展示出口 IP 与落地国家（仅展示；取不到不显示、不阻塞）
+    if [[ "$WARP_MODE" != "off" ]] && warp_profile_complete; then
+      warp_trace_info || true
+    fi
+    echo "1. IPv4 经 WARP（推荐：给纯 IPv6 机器补 IPv4 出口，其余流量直连）"
+    echo "2. 全部流量经 WARP"
+    echo "3. 关闭 WARP 出站（配置里不留任何 WARP 内容，零成本）"
+    echo "4. 更换 WARP IP（重新注册换一套参数，出口随之变更；频繁更换可能触发 Cloudflare 注册限流）"
+    echo "0. 返回上级"
+    local _c=""
+    read -t "$CHOICE_TIMEOUT" -rp "请选择 [0-4]（回车/输错/20 秒无输入 = 默认选择：0 返回）: " _c || _c="0"
+    case "$_c" in
+      1) warp_apply ipv4 || true ;;
+      2) warp_apply all || true ;;
+      3) warp_apply off || true ;;
+      4) warp_reroll || true ;;
       0) break ;;
       *) echo "[错误] 无效选择" ;;
     esac
@@ -2194,6 +2827,14 @@ show_port_status() {
   [[ "${TLS_DOMAIN_AUTO:-1}" == "1" ]] && _dom_desc="自动临时域名"
   [[ "${TLS_ACME:-0}" == "1" ]] && _dom_desc="$_dom_desc + 真证书/Cloudflare"
   echo "TLS 域名：${TLS_DOMAIN:-未设置}（$_dom_desc）"
+  local _warp_desc="关闭"
+  if [[ -f "$WARP_ENV_FILE" ]]; then
+    case "$(grep '^WARP_MODE=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)" in
+      ipv4) _warp_desc="IPv4 经 WARP" ;;
+      all) _warp_desc="全部经 WARP" ;;
+    esac
+  fi
+  echo "WARP 出站：$_warp_desc"
 }
 
 show_menu() {
@@ -2208,31 +2849,37 @@ show_menu() {
     show_port_status
     echo
     echo "1. 查看节点链接"
+    echo
     echo "2. 重启 sing-box 服务"
     echo "3. 更换 TLS 域名（可申请真证书/套 Cloudflare）"
     echo "4. Argo 隧道管理"
-    echo "5. 更换 UUID（全协议）"
-    echo "6. 更换端口"
-    echo "7. 更新 Reality 密钥对"
-    echo "8. 更新自签证书"
-    echo "9. 更新 sing-box 内核到最新版"
-    echo "10. 更新脚本到最新版"
-    echo "11. 卸载"
+    echo "5. WARP 出站管理"
+    echo
+    echo "6. 更换 UUID（全协议）"
+    echo "7. 更换端口"
+    echo "8. 更新 Reality 密钥对"
+    echo "9. 更新自签证书"
+    echo
+    echo "10. 更新 sing-box 内核到最新版"
+    echo "11. 更新脚本到最新版"
+    echo
+    echo "12. 卸载"
     echo "0. 退出"
     echo "==================================================="
-    read -rp "请选择 [0-11]: " choice
+    read -rp "请选择 [0-12]: " choice
     case "$choice" in
       1) load_env_or_exit; print_links ;;
-      2) load_env_or_exit; setup_service; echo "[完成] 服务已重启" ;;
+      2) do_restart ;;
       3) do_change_domain ;;
       4) do_argo_menu ;;
-      5) do_change_uuid ;;
-      6) do_change_ports ;;
-      7) do_change_reality ;;
-      8) do_change_cert ;;
-      9) detect_arch; if ! do_update_core; then echo "[提示] 内核更新未完成，见上方信息"; fi ;;
-      10) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
-      11) do_uninstall; break ;;
+      5) do_warp_menu ;;
+      6) do_change_uuid ;;
+      7) do_change_ports ;;
+      8) do_change_reality ;;
+      9) do_change_cert ;;
+      10) detect_arch; if ! do_update_core; then echo "[提示] 内核更新未完成，见上方信息"; fi ;;
+      11) if do_update_script; then exec /usr/local/bin/sbox menu; fi ;;
+      12) do_uninstall; break ;;
       0) echo "退出"; break ;;
       *) echo "[错误] 无效选择" ;;
     esac
@@ -2256,6 +2903,7 @@ case "$ACTION" in
     setup_shortcut
     load_or_gen_identity
     prompt_install_choices
+    warp_install_setup
     gen_certs
     write_config
     open_firewall
@@ -2266,6 +2914,7 @@ case "$ACTION" in
     print_links
     echo
     echo "[完成] 7 种协议已就绪，链接见上 / $LINKS_FILE"
+    [[ -n "${WARP_NOTE:-}" ]] && echo "$WARP_NOTE"
     ;;
   uninstall)
     do_uninstall
@@ -2285,6 +2934,12 @@ case "$ACTION" in
   change-argo)
     do_argo_menu
     ;;
+  change-warp)
+    do_warp_menu
+    ;;
+  warp-reroll)
+    load_env_or_exit; warp_reroll
+    ;;
   change-domain)
     do_change_domain
     ;;
@@ -2295,7 +2950,7 @@ case "$ACTION" in
     load_env_or_exit; print_links
     ;;
   restart)
-    load_env_or_exit; setup_service; echo "[完成] 服务已重启"
+    do_restart
     ;;
   update-script)
     do_update_script
@@ -2304,7 +2959,7 @@ case "$ACTION" in
     load_env_or_exit; detect_arch; do_update_core
     ;;
   *)
-    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-domain|change-ports|show-links|restart|update-script|update-core|version]"
+    echo "用法：$0 [install|uninstall|menu|change-uuid|change-reality|change-cert|change-argo|change-warp|warp-reroll|change-domain|change-ports|show-links|restart|update-script|update-core|version]"
     exit 1
     ;;
 esac

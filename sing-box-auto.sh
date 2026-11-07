@@ -52,7 +52,7 @@ else
   ACTION="${1:-install}"        # install | uninstall | menu | change-uuid | change-reality | change-cert | change-argo | change-domain | change-ports | show-links | restart | update-script | update-core | version
 fi
 
-SCRIPT_VERSION="1.1.0"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
+SCRIPT_VERSION="1.1.1"          # 脚本版本号（与仓库 tag / Release 对应，见 CHANGELOG.md）
 INPUT_TIMEOUT=60                # 输入类等待秒数：60 秒无输入自动按默认走下一步
 CHOICE_TIMEOUT=20               # 选择类等待秒数：20 秒无选择/回车一律取默认选择
 
@@ -737,7 +737,8 @@ validate_cf_domain() {
   _conf=$(cf_domain_conflicts "$_zid" "$_fqdn" "$_ip")
   if [[ -n "$_conf" ]]; then
     echo "[警告] $_fqdn 已有解析记录：$_conf"
-    read -t "$CHOICE_TIMEOUT" -rp "输入 y 覆盖这些记录并继续（回车/输错/20 秒无输入 = 默认选择：重新输入域名）: " _ans || _ans=""
+    _ans=""
+    read -t "$CHOICE_TIMEOUT" -rp "输入 y 覆盖这些记录并继续（回车/输错/20 秒无输入 = 默认选择：重新输入域名）: " _ans || true
     if [[ "$_ans" != "y" && "$_ans" != "Y" ]]; then
       return 1
     fi
@@ -1160,9 +1161,9 @@ domain_fail_next() {
   fi
   echo "[选择] 1) 重新输入域名  2) 使用默认域名（默认选择 = 1：回车、输错、20 秒不选都算默认；只有输 2 才用默认域名）"
   if [[ -n "$_src" ]]; then
-    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c < "$_src" || _c=""
+    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c < "$_src" || true
   else
-    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c || _c=""
+    read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1/2]: " _c || true
   fi
   [[ "$_c" == "2" ]] && return 1
   return 0
@@ -1212,7 +1213,8 @@ prompt_vtls_port() {
   echo "  4) 2083（注意：部分网络可能不支持）"
   echo "  5) 2087（注意：部分网络可能不支持）"
   echo "  6) 2096（注意：部分网络可能不支持）"
-  read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1-6]（回车/输错/20 秒不选，默认 443）: " _c </dev/tty || _c=""
+  _c=""
+  read -t "$CHOICE_TIMEOUT" -r -p "请选择 [1-6]（回车/输错/20 秒不选，默认 443）: " _c </dev/tty || true
   case "$_c" in
     2) _want=8443 ;;
     3) _want=2053 ;;
@@ -2273,7 +2275,7 @@ EOF
 load_warp_env() {
   WARP_MODE="off"; WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""
   WARP_RESERVED=""; WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""
-  WARP_MTU=""
+  WARP_MTU=""; WARP_ACCOUNT="free"; WARP_LICENSE=""
   [[ -f "$WARP_ENV_FILE" ]] || return 0
   local _v
   _v=$(grep '^WARP_MODE=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
@@ -2286,12 +2288,16 @@ load_warp_env() {
   WARP_ENDPOINT_HOST=$(grep '^WARP_ENDPOINT_HOST=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
   WARP_ENDPOINT_PORT=$(grep '^WARP_ENDPOINT_PORT=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
   WARP_MTU=$(grep '^WARP_MTU=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  _v=$(grep '^WARP_ACCOUNT=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
+  case "$_v" in free|plus|custom) WARP_ACCOUNT="$_v" ;; esac
+  WARP_LICENSE=$(grep '^WARP_LICENSE=' "$WARP_ENV_FILE" 2>/dev/null | cut -d'"' -f2 || true)
   # 字符集校验：私钥字段异常说明状态文件被污染，整份状态视为不可用，
   # 宁可日后重新注册，也不拿坏参数生成配置
   if [[ -n "$WARP_PRIVATE_KEY" && ! "$WARP_PRIVATE_KEY" =~ ^[A-Za-z0-9+/]{42,44}={0,2}$ ]]; then
     echo "[警告] warp.env 中的 WARP 私钥格式异常，已忽略现有 WARP 状态" >&2
     WARP_MODE="off"; WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""; WARP_RESERVED=""
     WARP_PEER_KEY=""; WARP_ENDPOINT_HOST=""; WARP_ENDPOINT_PORT=""; WARP_MTU=""
+    WARP_ACCOUNT="free"; WARP_LICENSE=""
   fi
   return 0
 }
@@ -2315,6 +2321,8 @@ save_warp_env() {
     printf 'WARP_ENDPOINT_HOST="%s"\n' "$WARP_ENDPOINT_HOST"
     printf 'WARP_ENDPOINT_PORT="%s"\n' "$WARP_ENDPOINT_PORT"
     printf 'WARP_MTU="%s"\n' "$WARP_MTU"
+    printf 'WARP_ACCOUNT="%s"\n' "${WARP_ACCOUNT:-free}"
+    printf 'WARP_LICENSE="%s"\n' "$WARP_LICENSE"
   } > "$_tmp" && mv -f "$_tmp" "$WARP_ENV_FILE"
   chmod 600 "$WARP_ENV_FILE"
 }
@@ -2359,7 +2367,16 @@ warp_fetch_wgcf() {
 # 用 wgcf 一次性注册并把参数解析进全局变量（不落盘，由调用方决定何时保存）。
 # wgcf 只在临时目录里存在，结束即删；注册有界重试 3 次、单次 60 秒超时。
 warp_register() {
-  echo "[信息] 正在用 wgcf 一次性注册 WARP 设备（用完即删，不常驻）…"
+  # WARP_LICENSE_ONCE：调用方一次性传入的 WARP+ 许可证密钥（可空）。非空时
+  # 在 register 与 generate 之间多走一步 wgcf update --license-key，把这台
+  # 设备绑成 WARP+ 账号；成功后密钥与账号类型由 save_warp_env 落盘（600），
+  # 日后「更换 WARP IP」会自动带上、保持 WARP+。为空就是普通免费账号。
+  local _lic="${WARP_LICENSE_ONCE:-}"
+  if [[ -n "$_lic" ]]; then
+    echo "[信息] 正在用 wgcf 一次性注册 WARP+ 设备（用完即删，不常驻）…"
+  else
+    echo "[信息] 正在用 wgcf 一次性注册 WARP 设备（用完即删，不常驻）…"
+  fi
   local _dir _try _ok=0
   _dir=$(mktemp -d)
   if ! warp_fetch_wgcf "$_dir/wgcf"; then
@@ -2368,6 +2385,7 @@ warp_register() {
   fi
   for _try in 1 2 3; do
     if ( cd "$_dir" && timeout 60 ./wgcf register --accept-tos >/dev/null 2>&1 \
+         && { [[ -z "$_lic" ]] || timeout 60 ./wgcf update --license-key "$_lic" >/dev/null 2>&1; } \
          && timeout 60 ./wgcf generate >/dev/null 2>&1 ) \
        && [[ -f "$_dir/wgcf-profile.conf" ]]; then
       _ok=1; break
@@ -2401,6 +2419,7 @@ warp_register() {
     WARP_RESERVED=$(printf '%s' "$_hex" | awk '{if (NF>=3) printf "%s,%s,%s", $1, $2, $3}')
   fi
   rm -rf "$_dir"
+  if [[ -n "$_lic" ]]; then WARP_ACCOUNT="plus"; WARP_LICENSE="$_lic"; else WARP_ACCOUNT="free"; WARP_LICENSE=""; fi
   [[ -n "$WARP_MTU" ]] || WARP_MTU="1280"
   if ! warp_profile_complete; then
     echo "[错误] WARP 注册结果不完整（wgcf 输出缺少必要参数）"
@@ -2518,11 +2537,29 @@ warp_trace_info() {
     if printf '%s' "$_txt" | grep -qE '^warp='; then break; fi
     _txt=""
   done
+  local _line=""
+  [[ -n "$_txt" ]] && _line=$(warp_trace_parse "$_txt" || true)
+  if [[ -n "$_line" ]]; then
+    # 同一探针会话内顺带做流媒体/AI 解锁判断（各一次短超时请求；仅展示用，
+    # 出口 IP 同理绝不落盘——判断结果只依赖状态码，不写任何 env/配置/链接）
+    local _nf _dp _cg _nf_t _dp_t _cg_t
+    _nf=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x "socks5h://127.0.0.1:$_port" "https://www.netflix.com/title/81280792" 2>/dev/null || true)
+    _dp=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x "socks5h://127.0.0.1:$_port" "https://www.disneyplus.com/" 2>/dev/null || true)
+    _cg=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -x "socks5h://127.0.0.1:$_port" "https://api.openai.com/v1/models" 2>/dev/null || true)
+    case "$_nf" in 200) _nf_t="Netflix 可看" ;; 301|302|404) _nf_t="Netflix 仅自制剧" ;; 403) _nf_t="Netflix 未解锁" ;; *) _nf_t="Netflix 不通" ;; esac
+    case "$_dp" in 200|301|302) _dp_t="Disney+ 可达" ;; 403) _dp_t="Disney+ 未解锁" ;; *) _dp_t="Disney+ 不通" ;; esac
+    case "$_cg" in 401) _cg_t="ChatGPT 可达" ;; 403) _cg_t="ChatGPT 未解锁" ;; *) _cg_t="ChatGPT 不通" ;; esac
+    kill "$_pid" >/dev/null 2>&1 || true
+    wait "$_pid" 2>/dev/null || true
+    rm -rf "$_dir"
+    printf '%s\n' "$_line"
+    printf '解锁参考：%s · %s · %s（经 WARP 出口实测）\n' "$_nf_t" "$_dp_t" "$_cg_t"
+    return 0
+  fi
   kill "$_pid" >/dev/null 2>&1 || true
   wait "$_pid" 2>/dev/null || true
   rm -rf "$_dir"
-  [[ -n "$_txt" ]] || return 1
-  warp_trace_parse "$_txt"
+  return 1
 }
 
 # 回滚 WARP 变更：恢复 auto.env / sb.json / warp.env 三件套备份并重启服务
@@ -2545,13 +2582,13 @@ warp_rollback() {
 # 参数直接复用，幂等）、落盘新状态、生成配置（子进程跑 write_config，挡住
 # 它校验失败时的 exit）、重启、出口自检；任一步失败自动回滚并说明原因。
 # $1=目标模式 off|ipv4|all  $2=1 时强制重新注册（换一套设备参数）
+# 切换 WARP 模式：需要时才注册（已有参数直接复用，幂等；_force=1 强制重新
+# 注册换一套参数），参数就绪后交给 _warp_commit 原子生效（备份/落盘/生成
+# 配置/重启/自检/失败回滚都在那一处，见其注释）
 warp_apply() {
   local _mode="$1" _force="${2:-0}"
   load_env_or_exit
   load_warp_env
-  cp -f "$ENV_FILE" "$ENV_FILE.bak" 2>/dev/null || true
-  [[ -f "$SB_DIR/sb.json" ]] && cp -f "$SB_DIR/sb.json" "$SB_DIR/sb.json.bak" || true
-  [[ -f "$WARP_ENV_FILE" ]] && cp -f "$WARP_ENV_FILE" "$WARP_ENV_FILE.bak" || true
   if [[ "$_mode" != "off" || "$_force" == "1" ]]; then
     if [[ "$_force" == "1" ]]; then
       WARP_PRIVATE_KEY=""; WARP_V4=""; WARP_V6=""; WARP_RESERVED=""
@@ -2560,11 +2597,22 @@ warp_apply() {
     if ! warp_profile_complete; then
       if ! warp_register; then
         echo "[错误] WARP 注册未完成，未做任何修改"
-        rm -f "$ENV_FILE.bak" "$SB_DIR/sb.json.bak" "$WARP_ENV_FILE.bak"
         return 1
       fi
     fi
   fi
+  _warp_commit "$_mode"
+}
+
+# 把当前全局变量里的 WARP 参数原子生效（调用前参数须已就绪：注册好或导入好）：
+# 先备份三件套、落盘新状态、生成配置、重启、出口自检；任一步失败自动回滚。
+# warp_apply（菜单切换/换 IP）与 warp_import（导入配置）共用，保证导入也走
+# 同一套备份—自检—回滚，不留半成品
+_warp_commit() {
+  local _mode="$1"
+  cp -f "$ENV_FILE" "$ENV_FILE.bak" 2>/dev/null || true
+  [[ -f "$SB_DIR/sb.json" ]] && cp -f "$SB_DIR/sb.json" "$SB_DIR/sb.json.bak" || true
+  [[ -f "$WARP_ENV_FILE" ]] && cp -f "$WARP_ENV_FILE" "$WARP_ENV_FILE.bak" || true
   WARP_MODE="$_mode"
   save_warp_env
   if ! ( write_config ); then
@@ -2608,7 +2656,7 @@ warp_install_setup() {
   fi
   local _choice="$_def" _ans=""
   if [[ -r /dev/tty ]]; then
-    read -t "$CHOICE_TIMEOUT" -r -p "WARP 出站：1=开启（IPv4 经 WARP） 2=全部经 WARP 3=关闭（回车/输错/20 秒无输入 = 默认选择：$_def_desc）: " _ans </dev/tty || _ans=""
+    read -t "$CHOICE_TIMEOUT" -r -p "WARP 出站：1=开启（IPv4 经 WARP） 2=全部经 WARP 3=关闭（回车/输错/20 秒无输入 = 默认选择：$_def_desc）: " _ans </dev/tty || true
     case "$_ans" in
       1) _choice="ipv4" ;;
       2) _choice="all" ;;
@@ -2621,10 +2669,28 @@ warp_install_setup() {
     echo "[信息] $WARP_NOTE"
     return 0
   fi
-  if warp_register && warp_probe; then
+  # WARP+ 许可证密钥是选填输入（输入类 60 秒）：直接回车/无输入/超时一律用
+  # 免费账号，不填也能装完；填了就注册成 WARP+。密钥注册失败再自动降级用
+  # 免费账号重试，绝不因为密钥问题堵住安装
+  local _lic=""
+  if [[ -r /dev/tty ]]; then
+    read -t "$INPUT_TIMEOUT" -r -p "WARP+ 许可证密钥（可空，直接回车 = 免费账号；60 秒无输入同回车）: " _lic </dev/tty || _lic=""
+    _lic="${_lic//[[:space:]]/}"
+  fi
+  WARP_LICENSE_ONCE="$_lic"
+  local _reg_ok=0
+  if warp_register; then
+    _reg_ok=1
+  elif [[ -n "$_lic" ]]; then
+    echo "[警告] WARP+ 密钥注册未成功，自动改用免费账号重试…"
+    WARP_LICENSE_ONCE=""
+    warp_register && _reg_ok=1
+  fi
+  if [[ "$_reg_ok" == "1" ]] && warp_probe; then
     WARP_MODE="$_choice"
     save_warp_env
     WARP_NOTE="WARP 出站：已开启（$(warp_mode_desc)）"
+    [[ "$WARP_ACCOUNT" == "plus" ]] && WARP_NOTE="$WARP_NOTE；账号：WARP+"
     # 总结里带上出口 IP 与落地国家（仅展示，取不到就跳过、不算失败）
     local _ti=""
     _ti=$(warp_trace_info || true)
@@ -2638,6 +2704,7 @@ warp_install_setup() {
     WARP_NOTE="WARP 出站：未开启（注册或出口自检未通过，已自动跳过；可日后运行 sbox change-warp 重试）"
     echo "[警告] $WARP_NOTE"
   fi
+  WARP_LICENSE_ONCE=""
   return 0
 }
 
@@ -2653,23 +2720,120 @@ warp_reroll() {
     return 0
   fi
   echo "[信息] 正在更换 WARP IP（重新注册一套设备参数，模式保持：$(warp_mode_desc)）…"
+  # WARP+ 账号换 IP 时带上已保存的许可证密钥重新绑定，保持 WARP+ 不降级
+  if [[ "$WARP_ACCOUNT" == "plus" && -n "$WARP_LICENSE" ]]; then
+    WARP_LICENSE_ONCE="$WARP_LICENSE"
+  fi
   if warp_apply "$WARP_MODE" 1; then
+    WARP_LICENSE_ONCE=""
     return 0
   fi
   echo "[提示] 更换 WARP IP 未成功，已恢复原有参数与配置（原出口 IP 保持不变）"
+  WARP_LICENSE_ONCE=""
+  return 0
+}
+
+# 填入 WARP+ 许可证密钥：重新注册并把设备绑成 WARP+ 账号。当前关闭时注册
+# 成功后顺带以 IPv4 经 WARP 启用；已开启时保持模式不变。走 warp_apply 的
+# 强制注册路径：注册/生成/自检任一步失败，原账号参数与配置原样不变
+warp_set_license() {
+  load_warp_env
+  local _lic=""
+  read -t "$INPUT_TIMEOUT" -rp "粘贴 WARP+ 许可证密钥（直接回车/60 秒无输入 = 取消）: " _lic || _lic=""
+  _lic="${_lic//[[:space:]]/}"
+  if [[ -z "$_lic" ]]; then
+    echo "[提示] 未输入密钥，已取消，账号与配置未变"
+    return 0
+  fi
+  if (( ${#_lic} < 10 || ${#_lic} > 64 )); then
+    echo "[错误] 这串长度不像 WARP+ 许可证密钥，已取消，账号与配置未变"
+    return 0
+  fi
+  local _mode="$WARP_MODE"
+  [[ "$_mode" == "off" ]] && _mode="ipv4"
+  WARP_LICENSE_ONCE="$_lic"
+  if warp_apply "$_mode" 1; then
+    echo "[完成] 已切换为 WARP+ 账号（密钥保存在 $WARP_ENV_FILE，权限 600）"
+  else
+    echo "[提示] WARP+ 注册未成功，账号与配置保持不变"
+  fi
+  WARP_LICENSE_ONCE=""
+  return 0
+}
+
+# 导入已有 WARP 配置：粘贴一份标准 WireGuard 配置（[Interface]/[Peer]），
+# 来源不限——官方 1.1.1.1 客户端导出的、Zero Trust（Teams）团队的、其他
+# 工具生成的都行。解析校验通过才替换参数，并走 _warp_commit 的备份—生成
+# —自检—回滚同一套路；失败时原参数与配置原样不变。当前关闭时导入成功后
+# 顺带以 IPv4 经 WARP 启用；已开启时保持模式不变
+warp_import() {
+  load_warp_env
+  echo "请粘贴 WireGuard 配置全文（[Interface] 与 [Peer] 两段都要），粘贴完输入单独一行 END 结束；未粘贴直接回车/60 秒无输入 = 取消："
+  local _txt="" _line _n=0
+  while (( _n < 40 )); do
+    IFS= read -t "$INPUT_TIMEOUT" -r _line || break
+    _line="${_line%$'\r'}"
+    [[ "$_line" == "END" ]] && break
+    if [[ -z "$_line" && -z "$_txt" ]]; then break; fi
+    _txt+="$_line"$'\n'
+    _n=$((_n + 1))
+  done
+  if [[ -z "$_txt" ]]; then
+    echo "[提示] 未收到配置，已取消，账号与配置未变"
+    return 0
+  fi
+  local _pk _addr _v4 _v6 _peer _ep _host _port _mtu _res _res_clean
+  _pk=$(printf '%s' "$_txt" | grep -E '^PrivateKey[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _addr=$(printf '%s' "$_txt" | grep -E '^Address[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _v4=$(printf '%s' "$_addr" | tr ',' '\n' | grep -E '^[0-9.]+/' | head -n 1 | cut -d/ -f1 || true)
+  _v6=$(printf '%s' "$_addr" | tr ',' '\n' | grep ':' | head -n 1 | cut -d/ -f1 || true)
+  _peer=$(printf '%s' "$_txt" | grep -E '^PublicKey[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _ep=$(printf '%s' "$_txt" | grep -E '^Endpoint[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _host="${_ep%:*}"; _port="${_ep##*:}"
+  _mtu=$(printf '%s' "$_txt" | grep -E '^MTU[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _res=$(printf '%s' "$_txt" | grep -E '^Reserved[[:space:]]*=' | head -n 1 | cut -d= -f2- | tr -d ' \r' || true)
+  _res_clean="${_res// /}"
+  local _bad=""
+  [[ "$_pk" =~ ^[A-Za-z0-9+/]{42,44}={0,2}$ ]] || _bad="PrivateKey"
+  [[ "$_peer" =~ ^[A-Za-z0-9+/]{42,44}={0,2}$ ]] || _bad="${_bad:+$_bad、}PublicKey"
+  [[ -n "$_v4" ]] || _bad="${_bad:+$_bad、}Address（缺 IPv4 地址）"
+  [[ "$_host" =~ ^[A-Za-z0-9.-]+$ && "$_port" =~ ^[0-9]+$ ]] || _bad="${_bad:+$_bad、}Endpoint"
+  if [[ -n "$_res" && ! "$_res_clean" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
+    _bad="${_bad:+$_bad、}Reserved"
+  fi
+  if [[ -n "$_bad" ]]; then
+    echo "[错误] 配置校验未通过：$_bad 不合法或缺失，已取消导入，账号与配置未变"
+    return 0
+  fi
+  WARP_PRIVATE_KEY="$_pk"; WARP_V4="$_v4"; WARP_V6="$_v6"; WARP_PEER_KEY="$_peer"
+  WARP_ENDPOINT_HOST="$_host"; WARP_ENDPOINT_PORT="$_port"
+  WARP_RESERVED="$_res_clean"; WARP_MTU="${_mtu:-1280}"
+  WARP_ACCOUNT="custom"; WARP_LICENSE=""
+  local _mode="$WARP_MODE"
+  [[ "$_mode" == "off" ]] && _mode="ipv4"
+  if _warp_commit "$_mode"; then
+    echo "[完成] 已导入自定义 WARP 配置并生效"
+  else
+    echo "[提示] 导入未生效，账号与配置保持不变（导入的配置出口自检未通过时会自动回滚）"
+  fi
   return 0
 }
 
 # WARP 出站管理子菜单
 do_warp_menu() {
   load_env_or_exit
+  local _idle=0
   while true; do
     load_warp_env
     echo
     echo "---------- WARP 出站管理 ----------"
     echo "当前模式：$(warp_mode_desc)"
     if warp_profile_complete; then
-      echo "注册状态：已注册（参数在 $WARP_ENV_FILE，重复开启直接复用、不重新注册）"
+      case "$WARP_ACCOUNT" in
+        plus)   echo "注册状态：已注册（WARP+ 账号，参数在 $WARP_ENV_FILE，重复开启直接复用、不重新注册）" ;;
+        custom) echo "注册状态：已注册（导入的自定义配置，参数在 $WARP_ENV_FILE，重复开启直接复用）" ;;
+        *)      echo "注册状态：已注册（参数在 $WARP_ENV_FILE，重复开启直接复用、不重新注册）" ;;
+      esac
     else
       echo "注册状态：未注册（首次开启时用 wgcf 一次性注册，用完即删）"
     fi
@@ -2680,15 +2844,36 @@ do_warp_menu() {
     echo "1. IPv4 经 WARP（推荐：给纯 IPv6 机器补 IPv4 出口，其余流量直连）"
     echo "2. 全部流量经 WARP"
     echo "3. 关闭 WARP 出站（配置里不留任何 WARP 内容，零成本）"
+    echo
     echo "4. 更换 WARP IP（重新注册换一套参数，出口随之变更；频繁更换可能触发 Cloudflare 注册限流）"
+    echo
+    echo "5. 填入 WARP+ 许可证密钥（重新注册为 WARP+ 账号；失败自动回滚不变）"
+    echo "6. 导入已有 WARP 配置（官方客户端 / Teams 等来源的 WireGuard 配置；失败自动回滚不变）"
+    echo
     echo "0. 返回上级"
     local _c=""
-    read -t "$CHOICE_TIMEOUT" -rp "请选择 [0-4]（回车/输错/20 秒无输入 = 默认选择：0 返回）: " _c || _c="0"
+    # 超时/回车不弹出本菜单：默认是留在菜单（子菜单是干活的地方，20 秒没
+    # 输入多半是人还没看完或终端慢）；连续 3 次无输入才返回上级，保证放着
+    # 不管也不会永远停在这里。关键：read 超时会把已敲入的部分内容留在
+    # 变量里，必须保留——旧写法 || _c="0" 会把它覆盖掉，慢终端上「先按 1
+    # 再回车、回车迟到」就被误判成选 0 弹回主菜单（v1.1.0 及以前的毛病）
+    read -t "$CHOICE_TIMEOUT" -rp "请选择 [0-6]（回车/输错/20 秒无输入 = 默认：留在本菜单）: " _c || true
+    if [[ -z "$_c" ]]; then
+      _idle=$((_idle + 1))
+      if (( _idle >= 3 )); then
+        echo "[提示] 连续 3 次无输入，返回上级"
+        break
+      fi
+      continue
+    fi
+    _idle=0
     case "$_c" in
       1) warp_apply ipv4 || true ;;
       2) warp_apply all || true ;;
       3) warp_apply off || true ;;
       4) warp_reroll || true ;;
+      5) warp_set_license || true ;;
+      6) warp_import || true ;;
       0) break ;;
       *) echo "[错误] 无效选择" ;;
     esac
